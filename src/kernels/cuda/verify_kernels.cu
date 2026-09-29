@@ -545,7 +545,7 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     unsigned long long t;
 #if defined(STRATA_HIP)
-    t = __builtin_amdgcn_s_memrealtime() * 10ull;   // gfx9: a constant 100 MHz counter -> ns
+    t = wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz (hipDeviceAttributeWallClockRate) -> ns
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 #endif
