@@ -32,7 +32,7 @@ constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800) && !defined(STRATA_HIP)  // HIP: no NVIDIA mma/cp.async
 __device__ __forceinline__ void load_a(TileA& a,const float* p) {
     const float* src=p+(threadIdx.x%16)*STRIDE+(threadIdx.x/16)*4;
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
@@ -60,7 +60,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
     const int row0=blockIdx.x*ROWS;
     if(row0>full)return;
     const int lane=threadIdx.x,warp=threadIdx.y;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800) || defined(STRATA_HIP)
     // Turing (STRATA_EXPERIMENTAL_SM75, a layer-split stage): no tf32 mma.  The same scores with FP32 FMAs, one row
     // per thread of the first warp - rounded differently from the tensor-core path (FP32 instead of TF32 inputs).
     if(warp!=0)return;

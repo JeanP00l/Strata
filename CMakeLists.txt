@@ -33,6 +33,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+# AMD GPUs (gfx906 / MI50 first): the same .cu sources compiled as HIP.  The CUDA runtime and cuBLAS names are
+# mapped by the headers in include/strata/platform/hip_compat/, which go first on the include path, and
+# CUDA::cudart / CUDA::cublas become aliases of HIP's targets, so every target below stays as it is.
+option(STRATA_ENABLE_HIP "Build the GPU targets for AMD GPUs through HIP (implies the CUDA targets)" OFF)
+if(STRATA_ENABLE_HIP)
+  set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
+endif()
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
 set(_strata_tests_default OFF)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro)
@@ -41,7 +48,24 @@ endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
-if(STRATA_ENABLE_CUDA)
+if(STRATA_ENABLE_HIP)
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx906 CACHE STRING "HIP architectures" FORCE)
+  endif()
+  enable_language(HIP)
+  find_package(hip REQUIRED)
+  find_package(hipblas REQUIRED)
+  add_library(CUDA::cudart INTERFACE IMPORTED)
+  target_link_libraries(CUDA::cudart INTERFACE hip::host)
+  target_compile_definitions(CUDA::cudart INTERFACE STRATA_HIP=1 __HIP_PLATFORM_AMD__=1)
+  target_include_directories(CUDA::cudart BEFORE INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/platform/hip_compat)
+  add_library(CUDA::cublas INTERFACE IMPORTED)
+  target_link_libraries(CUDA::cublas INTERFACE roc::hipblas CUDA::cudart)
+  set(CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/platform/hip_compat)
+  include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/platform/hip_compat)
+  add_compile_definitions(STRATA_HIP=1)
+  message(STATUS "Strata: HIP enabled, arch ${CMAKE_HIP_ARCHITECTURES}")
+elseif(STRATA_ENABLE_CUDA)
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
@@ -222,7 +246,7 @@ if(STRATA_ENABLE_CUDA)
     src/kernels/cuda/native_flash_attn.cu
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
-    PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+    PROPERTIES COMPILE_OPTIONS "$<IF:$<BOOL:${STRATA_ENABLE_HIP}>,,--use_fast_math>")
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
   set(STRATA_ORACLE_BUILD_DIR "" CACHE PATH "Matching existing shared llama.cpp build")
@@ -608,4 +632,16 @@ if(STRATA_BUILD_TESTS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
     add_subdirectory(tests)
   endif()
+endif()
+
+# ---- HIP: every CUDA source of the tree (and the ggml-cuda MMQ sources) is compiled as HIP ----
+if(STRATA_ENABLE_HIP)
+  file(GLOB_RECURSE _strata_cu CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/*.cu
+       ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision/*.cu)
+  if(_strata_mmq)
+    file(GLOB _strata_mmq_cu ${_strata_mmq}/*.cu ${_strata_mmq}/template-instances/*.cu)
+    list(APPEND _strata_cu ${_strata_mmq_cu})
+    target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP)
+  endif()
+  set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()

@@ -59,7 +59,14 @@ DeviceInfo device_info(int ordinal) {
     // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
     // is caught here, because a binary can be carried to a machine with an older card and would otherwise
     // silently take whatever path the driver chose.
+#if defined(STRATA_HIP)
+    // AMD: the build targets one gfx arch (CMAKE_HIP_ARCHITECTURES); a card of another arch fails at the first
+    // kernel launch with hipErrorInvalidDeviceFunction, which names itself.  gcnArchName says which it is.
+    if (p.gcnArchName[0] != 0) d.name += std::string(" (") + p.gcnArchName + ")";
+    if (false) {
+#else
     if (d.cc_major != 12) {
+#endif
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
                             "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",

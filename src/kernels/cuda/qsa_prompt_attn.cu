@@ -24,7 +24,7 @@ constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free 
 
 // The MMA and cp.async below need sm_80. Builds for older cards (the experimental sm_75 one) compile them to a trap;
 // qsa_prompt_attn_batch refuses such a device at run time, so the old kernel runs there.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800) && !defined(STRATA_HIP)  // HIP: no NVIDIA mma/cp.async
 #define STRATA_PA_SM80 1
 #else
 #define STRATA_PA_SM80 0
@@ -631,6 +631,9 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
     {   // sm_80 or newer (the MMA and cp.async above); an older card keeps the old kernel
+#if defined(STRATA_HIP)
+        return false;   // AMD: the tensor-core kernel is NVIDIA-only; the FP32 kernel runs
+#endif
         static int cc_major[64] = {};
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
