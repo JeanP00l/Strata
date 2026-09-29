@@ -246,4 +246,24 @@ static __device__ __forceinline__ unsigned int strata_vcmpne4(unsigned int a, un
 #define __vcmpeq4(a, b) strata_vcmpeq4((unsigned int) (a), (unsigned int) (b))
 #define __vcmpne4(a, b) strata_vcmpne4((unsigned int) (a), (unsigned int) (b))
 
+
+// __fmul_rn / __fadd_rn / __fsub_rn: on NVIDIA these are never contracted into an FMA (that is their point - the
+// engine uses them where a result must match a reference bit for bit).  HIP spells them as plain operators, which
+// clang's default -ffp-contract=fast-honor-pragmas may fuse.  The pragma keeps each one a separate rounding.
+static __device__ __forceinline__ float strata_fmul_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a * b;
+}
+static __device__ __forceinline__ float strata_fadd_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+static __device__ __forceinline__ float strata_fsub_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a - b;
+}
+#define __fmul_rn(a, b) strata_fmul_rn((a), (b))
+#define __fadd_rn(a, b) strata_fadd_rn((a), (b))
+#define __fsub_rn(a, b) strata_fsub_rn((a), (b))
+
 #endif  // device side
