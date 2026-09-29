@@ -186,6 +186,83 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
     }
 }
 
+
+#if defined(STRATA_HIP)
+// AMD (wave64): the same routing in ONE wavefront per token.  The block-wide kernel above spends its time in
+// barriers - 10 selection passes with two __syncthreads each over 8 logical warps - not in arithmetic (43 us per
+// token on gfx906).  Here every lane holds up to RW_PER probabilities in registers and each pass is a 64-lane
+// butterfly argmax: no LDS round trip, no block barrier.  Bit-identical to the kernel above: fmaxf trees are
+// exact, the exponentials and the (float) products are the same expressions, the sum stays one serial ascending
+// scan, and the argmax keeps the lowest index on a tie (a total order, so the butterfly's association is free).
+constexpr int RW_PER = 8;   // n_expert <= 64 * 8
+__global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __restrict__ logits, int n_tokens,
+                                                               int n_expert, int k, int* __restrict__ ids,
+                                                               float* __restrict__ weights) {
+    __shared__ double s_ex[64 * RW_PER];
+    __shared__ double s_sum;
+    const int t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const int lane = threadIdx.x;
+    const float* l = logits + (size_t) t * n_expert;
+    float lv[RW_PER];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < RW_PER; ++j) {
+        const int e = lane + 64 * j;
+        lv[j] = e < n_expert ? l[e] : -INFINITY;
+        mx = fmaxf(mx, lv[j]);
+    }
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 64));
+#pragma unroll
+    for (int j = 0; j < RW_PER; ++j) {
+        const int e = lane + 64 * j;
+        if (e < n_expert) s_ex[e] = exp((double) lv[j] - (double) mx);
+    }
+    __syncthreads();
+    if (lane == 0) {
+        double sum = 0.0;
+        for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
+        s_sum = sum;
+    }
+    __syncthreads();
+    const float inv = (float) (1.0 / s_sum);
+    float p[RW_PER];
+#pragma unroll
+    for (int j = 0; j < RW_PER; ++j) {
+        const int e = lane + 64 * j;
+        p[j] = e < n_expert ? (float) (s_ex[e] * inv) : -INFINITY;
+    }
+    unsigned taken = 0;
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int bi = n_expert;
+#pragma unroll
+        for (int j = 0; j < RW_PER; ++j) {
+            const int e = lane + 64 * j;
+            if (e >= n_expert || (taken >> j & 1u)) continue;
+            if (p[j] > bv || (p[j] == bv && e < bi)) { bv = p[j]; bi = e; }
+        }
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, 64);
+            const int oi = __shfl_xor(bi, off, 64);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (bi >= n_expert) break;
+        if ((bi & 63) == lane) taken |= 1u << (bi >> 6);
+        if (lane == 0) { ids[(size_t) t * k + i] = bi; weights[(size_t) t * k + i] = bv; }
+    }
+    if (lane == 0) {
+        double s = 0.0;
+        for (int i = 0; i < k; ++i) s += (double) weights[(size_t) t * k + i];
+        const double sc = fmax(s, 6.103515625e-05);       // 2**-14
+        for (int i = 0; i < k; ++i)
+            weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
+    }
+}
+#endif
+
 }  // namespace
 
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
@@ -200,6 +277,19 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
                      RT_MAX_THREADS * 64);
         std::exit(1);
     }
+#if defined(STRATA_HIP)
+    if (n_expert <= 64 * RW_PER && !std::getenv("STRATA_ROUTER_BLOCK")) {
+        router_top10_wave_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(logits, n_tokens, n_expert, k,
+                                                                                       ids, weights);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) std::exit(1);
+        return;
+    }
+#endif
     int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
     threads = (threads + 31) & ~31;                  // at least one full warp, for the reductions
     // the selection's taken-mask, then n_expert doubles for the exponentials, then n_expert floats for the
