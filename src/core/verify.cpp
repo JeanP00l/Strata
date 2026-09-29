@@ -796,7 +796,7 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", ""};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "[span]", ""};
     std::string out;
     char b[80];
     double total = 0;
@@ -804,7 +804,7 @@ std::string Verifier::profile_report() {
         out += k == 0 ? " GDN layers:" : " | QSA layers:";
         for (int i = 0; i < kProfPer; ++i) {
             if (prof_sum_[k][i] <= 0) continue;
-            total += prof_sum_[k][i];
+            if (i != 30) total += prof_sum_[k][i];   // the span overlaps the stages
             std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
             out += b;
         }
@@ -813,6 +813,10 @@ std::string Verifier::profile_report() {
     out += b;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
+    if (next_ != nullptr) {   // a layer split: the next GPU's stage has its own stamps (its own clock)
+        const std::string nx = next_->profile_report();
+        if (!nx.empty()) out += " || next stage:" + nx;
+    }
     return out;
 }
 
@@ -1058,13 +1062,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 prof_sum_[kind][i] += (double) (x - prev);
                 prev = x;
             }
-            if (l + 1 < L) prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
+            if (l + 1 < L && at(l + 1, 0) != 0 && at(l, 24) != 0 && at(l + 1, 0) > at(l, 24))   // this stage's layers only
+                prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
             prof_sum_[kind][27] += (double) (at(l, 27) - at(l, 0));    // hc-read0: norm
             prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
             prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
             prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
         }
         prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
+        {   // span: the stage's first layer start to its last layer's end (the rest of the stage's wall time is
+            // graph launch, the hand-off and the host's waits outside the stamps)
+            unsigned long long first = 0, last = 0;
+            for (int64_t l = 0; l < L; ++l) {
+                if (at(l, 0) != 0 && first == 0) first = at(l, 0);
+                if (at(l, 24) != 0) last = at(l, 24);
+            }
+            if (last > first && first != 0) prof_sum_[0][30] += (double) (last - first);
+        }
         ++prof_windows_;
     }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
