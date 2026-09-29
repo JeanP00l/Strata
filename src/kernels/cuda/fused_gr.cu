@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -293,6 +294,82 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     }
 }
 
+
+#if defined(STRATA_HIP)
+// ---- AMD: `gr_down_multi` split along K.  The CUDA kernel is one warp per row of w_down (320 + 4 rows), 41
+// blocks: on a 60-CU gfx906 that left most of the card idle and read the 6.5 MB matrix at ~100 GB/s.  Here a block
+// is 8 wavefronts = 8 rows of one K-slice of 2048 (the slice of every token's xn staged in LDS once), 41 x 5
+// blocks, and a second kernel adds the 5 slice sums in a fixed order and runs the epilogue.  A token's result does
+// not depend on how many tokens share the window (each column is reduced on its own).
+constexpr int GS_SL = 2048;                   // K per slice
+constexpr int GS_S = D / GS_SL;               // 5 slices
+constexpr int GS_ROWS = LR + HC;              // 324: the down rows, then the inject rows
+constexpr int GS_WAVES = 8;
+static_assert(D % GS_SL == 0 && GS_SL == 64 * 8 * 4, "a lane takes 4 chunks of 8 per slice");
+// the slice sums: a module-scope device array is per device by construction, and needs no allocation during a
+// graph capture
+__device__ float g_gr_part[GS_S * kFusedGrMaxT * GS_ROWS];
+__global__ void __launch_bounds__(GS_WAVES * 64) gr_down_split_kernel(GrMulti m) {
+    float* part = g_gr_part;
+    extern __shared__ __align__(16) float tile[];   // [T][GS_SL]
+    const int t = threadIdx.x, lane = t & 63, wave = t >> 6;
+    const int T = m.T, sl = blockIdx.y;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? wave : blockIdx.x * GS_WAVES + wave;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || wave >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow) + sl * (GS_SL / 8);
+    uint4 wv[4];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wv[q] = __ldg(w4 + lane + 64 * q);
+    }
+    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+    float4* tile4 = reinterpret_cast<float4*>(tile);
+    for (int i = t; i < T * (GS_SL / 4); i += GS_WAVES * 64) {
+        const int k = i / (GS_SL / 4), off = i - k * (GS_SL / 4);
+        tile4[i] = src4[((size_t) k * D + (size_t) sl * GS_SL) / 4 + off];
+    }
+    __syncthreads();
+    if (!active) return;
+    float acc[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int j = lane + 64 * q;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k)
+            if (k < T) acc[k] += dot8(wv[q], tile + k * GS_SL + j * 8);
+    }
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        if (k >= T) break;
+        float v = acc[k];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+        if (lane == 0) part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + (inject_block ? LR + row : row)] = v;
+    }
+}
+__global__ void gr_down_finish_kernel(GrMulti m) {
+    const float* part = g_gr_part;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = i / GS_ROWS, r = i - k * GS_ROWS;
+    if (k >= m.T) return;
+    const bool inject = r >= LR;
+    if (inject && m.a[0].w_inject == nullptr) return;
+    float s = 0.0f;
+#pragma unroll
+    for (int sl = 0; sl < GS_S; ++sl) s += part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + r];
+    if (inject) {
+        m.a[k].inject_out[r - LR] = s;
+    } else {
+        const float x = s / (float) HC;
+        m.a[k].lo[r] = x / (1.0f + __expf(-x));
+    }
+}
+
+#endif
 }  // namespace
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream) {
@@ -315,6 +392,21 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
     gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+#if defined(STRATA_HIP)
+    static const bool split_off = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "0";
+    if (!split_off) {
+        gr_down_split_kernel<<<dim3(DOWN_BLOCKS + 1, GS_S), GS_WAVES * 64, (size_t) n_tok * GS_SL * sizeof(float), st>>>(
+            m);
+        gr_down_finish_kernel<<<(unsigned) ((n_tok * GS_ROWS + 255) / 256), 256, 0, st>>>(m);
+        gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return;
+    }
+#endif
     // the shared-memory opt-in is a per-DEVICE setting: once per device, not once per process (a layer split
     // runs this kernel on two cards)
     static bool attr[64] = {};
