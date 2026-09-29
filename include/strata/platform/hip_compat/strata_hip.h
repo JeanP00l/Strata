@@ -139,6 +139,14 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphGetNodes hipGraphGetNodes
+#define cudaGraphNodeType hipGraphNodeType
+#define cudaGraphNodeGetType hipGraphNodeGetType
+#define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
+#define cudaGraphNodeTypeMemcpy hipGraphNodeTypeMemcpy
+#define cudaGraphNodeTypeMemset hipGraphNodeTypeMemset
+#define cudaKernelNodeParams hipKernelNodeParams
+#define cudaGraphKernelNodeGetParams hipGraphKernelNodeGetParams
+inline hipError_t cudaFuncGetName(const char** name, const void*) { *name = nullptr; return hipErrorNotSupported; }
 #define cudaFuncSetAttribute(fn, attr, val) hipFuncSetAttribute(reinterpret_cast<const void*>(fn), attr, val)
 #define cudaMemcpyToSymbol(sym, src, ...) hipMemcpyToSymbol(HIP_SYMBOL(sym), src, __VA_ARGS__)
 

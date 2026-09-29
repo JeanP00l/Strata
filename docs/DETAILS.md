@@ -12,7 +12,7 @@ New here? Start with the [README](../README.md) - it has everything you need to 
 
 ## Speed (measured)
 
-RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows, engine 0.1.14 with the settings setup writes
+RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows, engine 0.1.22 (prompts) / 0.1.14 (output) with the settings setup writes
 (`--prefill auto`, 8-bit KV above 4K, KV streaming from 64K). One code-agent prompt per length, 256 generated tokens,
 MTP speculative decoding on. "262K" is the model's full context window (a 259,943-token prompt). The IQ2_XS row was
 measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
@@ -21,11 +21,14 @@ measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Q2_0** | 494 | 1,007 | 1,308 | 1,294 | 1,208 | 967 |
-| **IQ2_XS** | 461 | 811 | 1,238 | 1,136 | 1,071 | 886 |
-| **IQ3_XXS** | 415 | 770 | 1,108 | 1,065 | 1,015 | - |
-| **IQ3_S** | 396 | 737 | 1,070 | 1,070 | 931 | - |
-| **Coder** | 599 | 1,152 | 1,298 | 1,350 | 1,266 | 1,034 |
+| **Q2_0** | 519 | 1,226 | 1,844 | 1,836 | 1,682 | 1,304 |
+| **IQ2_XS** | 524 | 1,196 | 1,799 | 1,611 | 1,495 | 1,181* |
+| **IQ3_XXS** | 472 | 974 | 1,555 | 1,449 | 1,386 | - |
+| **IQ3_S** | 419 | 893 | 1,499 | 1,285 | 1,245 | - |
+| **Coder** | 660 | 1,522 | 1,871 | 1,938 | 1,779 | 1,034** |
+
+Engine 0.1.22 (the prompt path of 0.1.23 is the same); `bench/results/2026-09-29-speed-0122`. \* measured with
+images on (the image encoder's VRAM reserve leaves fewer experts cached). \*\* not measured again: 0.1.14.
 
 ### Output (tokens/s)
 
@@ -216,6 +219,28 @@ install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it 
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 
+### Running it at startup (Task Scheduler)
+
+To have the model up at logon, people start the serve from **Task Scheduler** (or a service). Beware: Windows
+throttles such contexts, and the model's ~40 GB expert load then crawls at **~0.05 GiB/s (13-14 minutes)**
+instead of **~1.4-1.5 GiB/s (~35 seconds)** - a 24x slower start. Measured on an RTX 5070 Ti + Ryzen 7 9800X3D
++ NVMe, same binary, same args, same cache state:
+
+| How the serve starts | Expert load |
+| --- | ---: |
+| Double-click / terminal / SSH | 1.42-1.52 GiB/s (~35 s) |
+| Task Scheduler with its defaults | 0.05 GiB/s (821-841 s) |
+| Task Scheduler with the two settings below | 1.42 GiB/s (35 s) |
+
+In the task's properties set both of these (the defaults are the opposite):
+
+- **Priority level: Normal** (Options tab; the default is Below normal), and
+- **Run with highest privileges** (General tab; without it the task runs with a limited user token - which
+  also strips `SeLockMemoryPrivilege`, the privilege Windows large pages need).
+
+(Both were changed at once, so the isolated effect of each is not measured.) If the model still starts
+slowly, the engine prints a hint under its `loaded ... GiB at ...` line naming this cause.
+
 ### Chat in the terminal (optional)
 
 ```
@@ -254,10 +279,13 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
-| Model list / health | `GET /v1/models`, `GET /health` |
-| What the model is doing right now | `GET /status` |
+| Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
+| Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
+| What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
+
+`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
