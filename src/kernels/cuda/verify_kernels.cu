@@ -555,4 +555,26 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
+// DEBUG (STRATA_DBG_LAYER_HASH): an order-free fingerprint of each of n_tok rows (xor of a mix of index and bits)
+namespace { __global__ void dbg_hash_rows_kernel(const float* x, long long stride, long long len, unsigned long long* out) {
+    __shared__ unsigned long long part[256];
+    const float* r = x + (long long) blockIdx.x * stride;
+    unsigned long long h = 0;
+    for (long long i = threadIdx.x; i < len; i += blockDim.x) {
+        unsigned long long v = ((unsigned long long) __float_as_uint(r[i]) << 32) ^ (unsigned long long) (i * 0x9E3779B97F4A7C15ull);
+        v ^= v >> 33; v *= 0xff51afd7ed558ccdull; v ^= v >> 33;
+        h ^= v;
+    }
+    part[threadIdx.x] = h;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long a = 0;
+        for (int i = 0; i < (int) blockDim.x; ++i) a ^= part[i];
+        out[blockIdx.x] = a;
+    }
+} }
+void dbg_hash_rows(const float* x, int64_t stride, int64_t len, int n_tok, unsigned long long* out, void* stream) {
+    dbg_hash_rows_kernel<<<n_tok, 256, 0, (cudaStream_t) stream>>>(x, (long long) stride, (long long) len, out);
+}
+
 }  // namespace strata::kernels

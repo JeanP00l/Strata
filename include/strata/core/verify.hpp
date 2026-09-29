@@ -162,6 +162,9 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    bool dbg_on_ = false;                              // STRATA_DBG_LAYER_HASH: per (layer, point, token) fingerprints
+    unsigned long long* dbg_ = nullptr;
+    std::vector<unsigned long long> dbg_h_;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

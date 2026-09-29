@@ -40,6 +40,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+/// DEBUG: out[t] = an order-free fingerprint of row t of x (n_tok rows of `len` floats, `stride` apart).
+void dbg_hash_rows(const float* x, int64_t stride, int64_t len, int n_tok, unsigned long long* out, void* stream);
 
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's

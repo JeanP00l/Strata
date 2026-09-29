@@ -272,6 +272,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
+    dbg_on_ = std::getenv("STRATA_DBG_LAYER_HASH") != nullptr;
+    if (dbg_on_) {
+        const size_t nd = (size_t) g.n_layers * 5 * (size_t) max_t_;
+        const size_t nk = (size_t) g.n_layers * (size_t) max_t_ * (size_t) ss.k;   // per expert row: parts, hit_out
+        if (cudaMalloc((void**) &dbg_, (nd + 2 * nk) * 8) != cudaSuccess) { dbg_on_ = false; dbg_ = nullptr; cudaGetLastError(); }
+        else { cudaMemset(dbg_, 0, (nd + 2 * nk) * 8); dbg_h_.assign(nd + 2 * nk, 0); }
+    }
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -593,7 +600,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (dbg_on_) dbg_hash_rows(bo_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 0) * max_t_ + tb, cs);
         gr_read_group(1, true, inj_, inj2_);
+        if (dbg_on_) dbg_hash_rows(mixed_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 1) * max_t_ + tb, cs);
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -728,6 +737,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
         stamp(l, 24, grp);
+        if (dbg_on_) {
+            dbg_hash_rows(bo_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 2) * max_t_ + tb, cs);
+            dbg_hash_rows(shared_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 3) * max_t_ + tb, cs);
+            dbg_hash_rows(parts_ + (size_t) tb * K * N, K * N, K * N, n, dbg_ + ((size_t) l * 5 + 4) * max_t_ + tb, cs);
+            unsigned long long* dk = dbg_ + (size_t) g.n_layers * 5 * max_t_;
+            const size_t nk = (size_t) g.n_layers * (size_t) max_t_ * (size_t) K, o = ((size_t) l * max_t_ + tb) * K;
+            dbg_hash_rows(parts_ + (size_t) tb * K * N, N, N, n * (int) K, dk + o, cs);
+            dbg_hash_rows(hit_out_ + (size_t) tb * K * N, N, N, n * (int) K, dk + nk + o, cs);
+        }
         if (l == g.n_layers - 1) {
             for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
             if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
@@ -1049,6 +1067,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (dbg_on_) cudaMemcpy(dbg_h_.data(), dbg_, dbg_h_.size() * 8, cudaMemcpyDeviceToHost);
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;
@@ -1181,6 +1200,27 @@ void Verifier::publish_plan(void* ctx) {
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (dbg_on_)   // the kept tokens' fingerprints: mixer out, FFN in, MoE out per layer
+        for (int t = 0; t < n_keep; ++t)
+            for (int64_t l = lb_; l < le_; ++l)
+                std::fprintf(stderr, "strata dbg: pos %lld l %lld %04llx %04llx %04llx %04llx %04llx (T %d t %d)\n",
+                             (long long) (last_pos0_ + t), (long long) l, dbg_h_[((size_t) l * 5 + 0) * max_t_ + t] & 0xffff,
+                             dbg_h_[((size_t) l * 5 + 1) * max_t_ + t] & 0xffff, dbg_h_[((size_t) l * 5 + 2) * max_t_ + t] & 0xffff,
+                             dbg_h_[((size_t) l * 5 + 3) * max_t_ + t] & 0xffff, dbg_h_[((size_t) l * 5 + 4) * max_t_ + t] & 0xffff,
+                             last_t_, t);
+    if (dbg_on_ && std::getenv("STRATA_DBG_LAYER_HASH")[0] == '2')   // per routed expert (k order): its row, g = the GPU's
+        for (int t = 0; t < n_keep; ++t)
+            for (int64_t l = lb_; l < le_; ++l) {
+                const size_t K = (size_t) ss_->k, nk = (size_t) g_->n_layers * (size_t) max_t_ * K, o = ((size_t) l * max_t_ + t) * K;
+                const unsigned long long* dk = dbg_h_.data() + (size_t) g_->n_layers * 5 * max_t_;
+                std::string sline;
+                char b[48];
+                for (size_t j = 0; j < K; ++j) {
+                    std::snprintf(b, sizeof b, " %04llx%s", dk[o + j] & 0xffff, dk[o + j] == dk[nk + o + j] ? "g" : "c");
+                    sline += b;
+                }
+                std::fprintf(stderr, "strata dbgk: pos %lld l %lld%s\n", (long long) (last_pos0_ + t), (long long) l, sline.c_str());
+            }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
