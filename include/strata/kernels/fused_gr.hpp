@@ -49,4 +49,7 @@ constexpr int kFusedGrMaxT = 8;
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+/// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
+void fused_gr_set_fast(int on);
+
 }  // namespace strata::kernels
