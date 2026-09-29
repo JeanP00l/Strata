@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -30,7 +31,28 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             cudaDeviceProp prop;
             CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
             auto & d = in.devices[id];
+#if defined(GGML_USE_HIP)
+            // AMD: ggml's arch code is GGML_CUDA_CC_OFFSET_AMD + 0x<major><minor><stepping> from gcnArchName (as
+            // ggml-cuda.cu's ggml_cuda_parse_id does); major/minor would read as an NVIDIA generation (gfx906 -> 9.0,
+            // "Hopper") and MMQ would launch with NVIDIA tile shapes against AMD-compiled kernels - it hangs.
+            {
+                const char * name = prop.gcnArchName;
+                if (std::strncmp(name, "gfx", 3) == 0) name += 3;
+                char arch[16] = {};
+                std::size_t n = std::strcspn(name, ":-");
+                if (n >= sizeof(arch)) n = sizeof(arch) - 1;
+                std::memcpy(arch, name, n);
+                int code = 0;
+                if (n >= 3) {
+                    const int minor = (int) std::strtoul(arch + n - 2, nullptr, 16);
+                    arch[n - 2] = '\0';
+                    code = ((int) std::strtoul(arch, nullptr, 16) << 8) | minor;
+                }
+                d.cc = GGML_CUDA_CC_OFFSET_AMD + code;
+            }
+#else
             d.cc = 100 * prop.major + 10 * prop.minor;
+#endif
             d.nsm = prop.multiProcessorCount;
             d.smpb = prop.sharedMemPerBlock;
             d.smpbo = prop.sharedMemPerBlockOptin;

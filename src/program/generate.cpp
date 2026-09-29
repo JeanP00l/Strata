@@ -2129,6 +2129,12 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int64_t room = stage_room(st.dev, true);
         const strata::core::OnDevice on(st.dev);
+        {
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
+                         st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
+        }
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {

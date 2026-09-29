@@ -151,14 +151,17 @@ inline hipError_t cudaGraphInstantiate(hipGraphExec_t* exec, hipGraph_t graph, h
                                        char* log, size_t log_size) {
     return hipGraphInstantiate(exec, graph, err_node, log, log_size);
 }
-// cudaInitDevice(dev, deviceFlags, flags): set the device and its scheduling flags before the context exists.
+// cudaInitDevice(dev, deviceFlags, flags): initialise a device and its scheduling flags WITHOUT making it the
+// current device (CUDA's contract; the layer split relies on it - a changed current device put GPU 0's expert
+// cache on GPU 1).
 inline hipError_t cudaInitDevice(int device, unsigned int device_flags, unsigned int /*flags*/) {
-    hipError_t e = hipSetDevice(device);
+    int prev = 0;
+    hipError_t e = hipGetDevice(&prev);
     if (e != hipSuccess) return e;
-    e = hipSetDeviceFlags(device_flags);
-    // HIP refuses flags on a device whose context is already active; CUDA's cudaInitDevice would too
-    if (e != hipSuccess) (void) hipGetLastError();
-    return hipSuccess;
+    e = hipSetDevice(device);
+    if (e != hipSuccess) return e;
+    if (hipSetDeviceFlags(device_flags) != hipSuccess) (void) hipGetLastError();   // context already active
+    return hipSetDevice(prev);
 }
 
 // ---- device side -----------------------------------------------------------------------------------------
