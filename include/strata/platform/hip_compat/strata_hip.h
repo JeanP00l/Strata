@@ -269,4 +269,15 @@ static __device__ __forceinline__ float strata_fsub_rn(float a, float b) {
 #define __fadd_rn(a, b) strata_fadd_rn((a), (b))
 #define __fsub_rn(a, b) strata_fsub_rn((a), (b))
 
+
+// __byte_perm(x, y, s): HIP's own version builds an 8-byte array and indexes it - the array lands in SCRATCH
+// memory, and every IQ4 codebook lookup went through it (a 0.9 MB IQ4_NL GEMV took 290 us, ~3 GB/s).  gfx906 has
+// v_perm_b32, which selects bytes of {src0:src1} (src1 low) by byte selectors 0-7: the same operation, one
+// instruction.  CUDA reads the low 3 bits of each of the four low selector nibbles.
+static __device__ __forceinline__ unsigned int strata_byte_perm(unsigned int x, unsigned int y, unsigned int s) {
+    const unsigned int sel = (s & 0x7u) | ((s & 0x70u) << 4) | ((s & 0x700u) << 8) | ((s & 0x7000u) << 12);
+    return __builtin_amdgcn_perm(y, x, sel);
+}
+#define __byte_perm(x, y, s) strata_byte_perm((unsigned int) (x), (unsigned int) (y), (unsigned int) (s))
+
 #endif  // device side

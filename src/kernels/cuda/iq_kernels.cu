@@ -38,6 +38,18 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
+#if defined(STRATA_HIP)
+    // AMD: llama.cpp's HIP lookup (vecdotq.cuh) - v_perm_b32 takes 3-bit byte indices, so the low and high halves
+    // of the table are looked up and the index MSB picks between them: 4 perms per 8 values.
+    const uint32_t* v32 = reinterpret_cast<const uint32_t*>(table);
+    const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(v32[1], v32[0], q_even & 0x07070707u);
+    const uint32_t ol = __builtin_amdgcn_perm(v32[1], v32[0], q_odd & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(v32[3], v32[2], q_even & 0x07070707u);
+    const uint32_t oh = __builtin_amdgcn_perm(v32[3], v32[2], q_odd & 0x07070707u);
+    return make_int2((int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((q_even & 0x08080808u) >> 1)),
+                     (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((q_odd & 0x08080808u) >> 1)));
+#else
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
     const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
@@ -49,6 +61,7 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
         tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
     }
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+#endif
 }
 #define ggml_cuda_dp4a(a, b, c) __dp4a((a), (b), (c))
 
