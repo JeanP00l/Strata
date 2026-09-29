@@ -345,6 +345,11 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(quantize_act_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME quantize_act_parity COMMAND quantize_act_parity --selftest)
 
+  add_executable(route_window_parity src/kernels/route_window_parity.cpp)
+  target_include_directories(route_window_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(route_window_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME route_window_parity COMMAND route_window_parity)
+
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
   target_include_directories(router_top10_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(router_top10_parity PRIVATE strata_kernels CUDA::cudart)

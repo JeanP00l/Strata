@@ -4203,6 +4203,9 @@ int main(int argc, char** argv) {
                                          "pool + plan %.3f ms, host staging %.3f ms, commit %.3f ms\n", st,
                                  (long long) v.windows, v.ms_wait / w, v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
                 }
+            if (static const bool mt_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; mt_timing && mtp.rounds > 0)
+                std::fprintf(stderr, "strata serve: mtp: %.3f ms/round drafting (%lld rounds since start)\n",
+                             mtp.ms_draft / (double) mtp.rounds, (long long) mtp.rounds);
             if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 uint64_t miss = 0, look = 0;

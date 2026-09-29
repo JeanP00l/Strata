@@ -44,5 +44,9 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 /// No allocations or synchronization, including when stream is null (the CUDA default stream).
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream);
+/// `ncols` columns at once: x is [ncols][n_in], y is [ncols][n_out]; each column bitwise equal to a
+/// `bf16_gemv_fp32_mmvf` call on it.
+void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int ncols,
+                              void* stream);
 
 }  // namespace strata::kernels
