@@ -54,4 +54,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
 
+/// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
+/// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
+void native_expert_set_mode(int mode, int phase);
+
 }  // namespace strata::kernels
