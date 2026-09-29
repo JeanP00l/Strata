@@ -2918,6 +2918,17 @@ int main(int argc, char** argv) {
         }
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
+        // a file-backed arena (STRATA_ARENA_MMAP): the experts no GPU holds are the ones the CPU pool and the
+        // prompt path will read - start reading them now instead of faulting them in 4 KB at a time mid-request
+        {
+            int64_t pf = 0;
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] == strata::core::kNotResident) {
+                    srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+                    ++pf;
+                }
+            (void) pf;
+        }
         for (auto& st : stages) {   // layer split across GPUs: the same table on every device
             const strata::core::OnDevice on(st->dev);
             if (cudaMalloc((void**) &st->d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
