@@ -720,6 +720,173 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
+
+#if defined(STRATA_HIP)
+// ---- AMD layouts for the grouped native experts (STRATA_EXP_MODE; 0 = the CUDA one above).
+// 1 (W64): a row per 64-lane wavefront - 4x the wavefronts, ~1-2 calls per lane, a 64-lane butterfly.
+// 2 (R2):  a 32-lane logical warp computes TWO rows in one loop - two independent load chains in flight.
+// Either way a (row, entry) sum does not depend on the window size.
+template<int TY>
+__device__ __forceinline__ float row_dot64(const uint8_t* row, const block_q8_1* x, int nb, int lane) {
+    using F = Fmt<TY>;
+    float s = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 64) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
+    }
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) s += __shfl_xor(s, o, 64);
+    return s;
+}
+template<int TY>
+__device__ __forceinline__ void row_dot2(const uint8_t* r0, const uint8_t* r1, const block_q8_1* x, int nb, int lane,
+                                         float& o0, float& o1) {
+    using F = Fmt<TY>;
+    float s0 = 0.0f, s1 = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const block_q8_1* xk = x + kbx * (F::qk / 32);
+        const float a = F::dot(r0, xk, kbx, iqs);
+        const float b = F::dot(r1, xk, kbx, iqs);
+        s0 += a;
+        s1 += b;
+    }
+    o0 = warp_sum(s0);
+    o1 = warp_sum(s1);
+}
+template<int TY, int NR>
+__device__ __forceinline__ void row_dotn(const uint8_t* const* r, const block_q8_1* x, int nb, int lane, float* o) {
+    using F = Fmt<TY>;
+    float acc[NR];
+#pragma unroll
+    for (int i = 0; i < NR; ++i) acc[i] = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const block_q8_1* xk = x + kbx * (F::qk / 32);
+        float d[NR];
+#pragma unroll
+        for (int i = 0; i < NR; ++i) d[i] = F::dot(r[i], xk, kbx, iqs);
+#pragma unroll
+        for (int i = 0; i < NR; ++i) acc[i] += d[i];
+    }
+#pragma unroll
+    for (int i = 0; i < NR; ++i) o[i] = warp_sum(acc[i]);
+}
+template<int TG, int MODE>
+__global__ void __launch_bounds__(256) native_gu_amd_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_tok,
+                                                            const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                            float* __restrict__ gate, float* __restrict__ up) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int nrow = 2 * (int) L.n_ff;
+    auto wrow = [&](int row) -> const uint8_t* {
+        const bool is_up = row >= L.n_ff;
+        return blob + (is_up ? L.up_off : 0) + (size_t) (is_up ? row - (int) L.n_ff : row) * L.gu_row;
+    };
+    auto put = [&](int row, int e, float v) {
+        const bool is_up = row >= L.n_ff;
+        (is_up ? up : gate)[(size_t) e * L.n_ff + (is_up ? row - (int) L.n_ff : row)] = v;
+    };
+    if constexpr (MODE == 1) {
+        const int lane = threadIdx.x & 63, row = blockIdx.x * 4 + (threadIdx.x >> 6);
+        if (row >= nrow) return;
+        const uint8_t* wr = wrow(row);
+        for (int e = e0; e < e1; ++e) {
+            const float v = row_dot64<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+            if (lane == 0) put(row, e, v);
+        }
+    } else if constexpr (MODE == 4) {
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        const int row0 = blockIdx.x * 32 + warp;
+        if (row0 >= nrow) return;
+        const uint8_t* w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[i] = wrow(row0 + 8 * i < nrow ? row0 + 8 * i : row0);
+        for (int e = e0; e < e1; ++e) {
+            float o[4];
+            row_dotn<TG, 4>(w, xq + (size_t) ent_tok[e] * xb, nb, lane, o);
+            if (lane == 0)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) if (row0 + 8 * i < nrow) put(row0 + 8 * i, e, o[i]);
+        }
+    } else {
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        const int row0 = blockIdx.x * 16 + warp, row1 = row0 + 8;
+        if (row0 >= nrow) return;
+        const bool two = row1 < nrow;
+        const uint8_t* w0 = wrow(row0);
+        const uint8_t* w1 = wrow(two ? row1 : row0);
+        for (int e = e0; e < e1; ++e) {
+            float a, b;
+            row_dot2<TG>(w0, w1, xq + (size_t) ent_tok[e] * xb, nb, lane, a, b);
+            if (lane == 0) { put(row0, e, a); if (two) put(row1, e, b); }
+        }
+    }
+}
+template<int TD, int MODE>
+__global__ void __launch_bounds__(256) native_down_amd_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_dst,
+                                                              const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                              float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int nrow = (int) L.n_embd;
+    if constexpr (MODE == 1) {
+        const int lane = threadIdx.x & 63, r = blockIdx.x * 4 + (threadIdx.x >> 6);
+        if (r >= nrow) return;
+        const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+        for (int e = e0; e < e1; ++e) {
+            const float v = row_dot64<TD>(wr, hq + (size_t) e * hb, nb, lane);
+            if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = v;
+        }
+    } else if constexpr (MODE == 4) {
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        const int r0 = blockIdx.x * 32 + warp;
+        if (r0 >= nrow) return;
+        const uint8_t* w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) w[i] = blob + L.down_off + (size_t) (r0 + 8 * i < nrow ? r0 + 8 * i : r0) * L.d_row;
+        for (int e = e0; e < e1; ++e) {
+            float o[4];
+            row_dotn<TD, 4>(w, hq + (size_t) e * hb, nb, lane, o);
+            if (lane == 0)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) if (r0 + 8 * i < nrow) out[(size_t) ent_dst[e] * L.n_embd + r0 + 8 * i] = o[i];
+        }
+    } else {
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        const int r0 = blockIdx.x * 16 + warp, r1 = r0 + 8;
+        if (r0 >= nrow) return;
+        const bool two = r1 < nrow;
+        const uint8_t* w0 = blob + L.down_off + (size_t) r0 * L.d_row;
+        const uint8_t* w1 = blob + L.down_off + (size_t) (two ? r1 : r0) * L.d_row;
+        for (int e = e0; e < e1; ++e) {
+            float a, b;
+            row_dot2<TD>(w0, w1, hq + (size_t) e * hb, nb, lane, a, b);
+            if (lane == 0) {
+                out[(size_t) ent_dst[e] * L.n_embd + r0] = a;
+                if (two) out[(size_t) ent_dst[e] * L.n_embd + r1] = b;
+            }
+        }
+    }
+}
+int exp_mode() {
+    static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : 2; }();
+    return m;
+}
+#endif
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream) {
@@ -732,6 +899,22 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
+#if defined(STRATA_HIP)
+    const int em = exp_mode();
+    const dim3 ggu_amd((unsigned) ((2 * L.n_ff + (em == 1 ? 3 : em == 4 ? 31 : 15)) / (em == 1 ? 4 : em == 4 ? 32 : 16)), (unsigned) cap_groups);
+#define STRATA_GU_AMD(T) \
+    case T: if (em == 1) native_gu_amd_kernel<T, 1><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
+            else if (em == 4) native_gu_amd_kernel<T, 4><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
+            else native_gu_amd_kernel<T, 2><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+    if (em == 1 || em == 2 || em == 4) {
+        switch (L.gu_type) {
+            STRATA_GU_AMD(16) STRATA_GU_AMD(17) STRATA_GU_AMD(18) STRATA_GU_AMD(21) STRATA_GU_AMD(22) STRATA_GU_AMD(23)
+            STRATA_GU_AMD(29) STRATA_GU_AMD(42)
+            default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+        }
+    } else
+#undef STRATA_GU_AMD
+#endif
     switch (L.gu_type) {
         case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -748,6 +931,20 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
+#if defined(STRATA_HIP)
+    const dim3 gd_amd((unsigned) ((L.n_embd + (em == 1 ? 3 : em == 4 ? 31 : 15)) / (em == 1 ? 4 : em == 4 ? 32 : 16)), (unsigned) cap_groups);
+#define STRATA_D_AMD(T) \
+    case T: if (em == 1) native_down_amd_kernel<T, 1><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
+            else if (em == 4) native_down_amd_kernel<T, 4><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
+            else native_down_amd_kernel<T, 2><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+    if (em == 1 || em == 2 || em == 4) {
+        switch (L.d_type) {
+            STRATA_D_AMD(20) STRATA_D_AMD(23) STRATA_D_AMD(42)
+            default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
+        }
+    } else
+#undef STRATA_D_AMD
+#endif
     switch (L.d_type) {
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
