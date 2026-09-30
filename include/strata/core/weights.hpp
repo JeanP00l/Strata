@@ -128,6 +128,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend class TpWeights;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
 };

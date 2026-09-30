@@ -124,6 +124,8 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
+    for (void* p : {(void*) tp_ch_.recv, (void*) tp_ch_.flags, (void*) tp_ch_.seq, (void*) tp_ch_.err})
+        strata::kernels::tp_free(p);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
@@ -184,6 +186,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+    const int64_t FFR = tp_ff_ > 0 ? tp_ff_ : g.n_ff;
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
@@ -250,9 +253,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        // the ROUTED experts' width: under a tensor split the geometry's n_ff is the half shared expert's
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, FFR),
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), FFR)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -289,7 +293,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
+    if (tp_half_ >= 0 && tp_same_) {   // two halves on one GPU: each its own queue and half the compute units
+        cs_ = (cudaStream_t) strata::kernels::tp_stream_cu_half(tp_half_);
+        if (cs_ == nullptr) { err = "verify: the tensor split's CU-masked stream failed"; return false; }
+    } else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -346,6 +353,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
+    int xstep = 0;   // tensor split: the window's exchanges, in the same order on both halves
+    if (tp_half_ >= 0 && (G != 1 || lb_ != 0 || le_ != g.n_layers || tp_ch_.recv == nullptr)) {
+        err = "verify: a tensor-split half runs the whole model in one token group, paired (tp_pair) before its first run";
+        return false;
+    }
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -607,6 +619,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (tp_half_ >= 0) tp_allreduce(bo_ + tb * N, (int64_t) n * N, tp_ch_, xstep++, cs);   // the mixer's two halves
         if (dbg_on_) dbg_hash_rows(bo_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 0) * max_t_ + tb, cs);
         gr_read_group(1, true, inj_, inj2_);
         if (dbg_on_) dbg_hash_rows(mixed_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 1) * max_t_ + tb, cs);
@@ -631,13 +644,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (device_plan_ && tp_routed())   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        if (tp_routed())   // a tensor split's half 1 has no routed experts: the host never serves it
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -675,6 +689,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+        if (!tp_routed()) {
+            // a tensor split's half 1: its share is the shared expert's half only - parts_ stays all zeros (never
+            // written), so the combine below gives exactly `shared_`
+        } else {
         if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
@@ -733,6 +751,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         }
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        }
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
@@ -743,6 +762,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
+        if (tp_half_ >= 0) tp_allreduce(bo_ + tb * N, (int64_t) n * N, tp_ch_, xstep++, cs);   // the MoE's two halves
         stamp(l, 24, grp);
         if (dbg_on_) {
             dbg_hash_rows(bo_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 2) * max_t_ + tb, cs);
@@ -769,6 +789,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
+    if (tp_half_ >= 0) {
+        tp_advance(tp_ch_, (uint32_t) xstep, cs);
+        if (!tp_head()) return true;   // half 1: the residual is the same on both halves; half 0 runs the head
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         for (int t = 0; t < T; ++t) {
             copy_from_mapped(hand_out_ + (size_t) t * HB, Rt(t), HC * N, cs);
@@ -972,10 +996,8 @@ bool Verifier::capture_commit(std::string& err) {
     return true;
 }
 
-bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                   std::string& err) {
+bool Verifier::stage_window(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -1012,6 +1034,57 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
+    return true;
+}
+
+bool Verifier::tp_pair(Verifier& h0, Verifier& h1, std::string& err) {
+    using namespace strata::kernels;
+    if (h0.tp_half_ != 0 || h1.tp_half_ != 1 || h0.max_t_ != h1.max_t_ || h0.g_ == nullptr || h1.g_ == nullptr ||
+        h0.g_->n_embd != h1.g_->n_embd) {
+        err = "verify: tp_pair needs an initialized half 0 and half 1 of the same window size";
+        return false;
+    }
+    const char* tv = std::getenv("STRATA_TP_TIMEOUT_MS");
+    const double timeout_ms = tv ? std::atof(tv) : 10000.0;   // seconds: a late host launch once took > 200 ms
+    Verifier* side[2] = {&h0, &h1};
+    for (Verifier* v : side) {
+        const OnDevice on(v->device_);
+        TpChannel& ch = v->tp_ch_;
+        ch.slot_floats = (int64_t) v->max_t_ * v->g_->n_embd;
+        ch.recv = (float*) tp_alloc_uncached((size_t) (2 * ch.slot_floats) * sizeof(float));
+        ch.flags = (uint32_t*) tp_alloc_uncached((size_t) (2 * kTpMaxBlocks) * sizeof(uint32_t));
+        ch.seq = (uint32_t*) tp_alloc_uncached(64);
+        ch.err = (uint32_t*) tp_alloc_uncached(64);
+        ch.half = v->tp_half_;
+        ch.timeout_ticks = (uint64_t) (timeout_ms * 25000.0);   // the 25 MHz wall clock
+        if (!ch.recv || !ch.flags || !ch.seq || !ch.err) { err = "verify: the tensor split's exchange buffers failed"; return false; }
+    }
+    h0.tp_ch_.peer_recv = h1.tp_ch_.recv;
+    h0.tp_ch_.peer_flags = h1.tp_ch_.flags;
+    h1.tp_ch_.peer_recv = h0.tp_ch_.recv;
+    h1.tp_ch_.peer_flags = h0.tp_ch_.flags;
+    h0.tp_peer_ = &h1;
+    h1.tp_peer_ = &h0;
+    std::fprintf(stderr, "strata verify: tensor split paired (devices %d and %d, exchange timeout %.0f ms)\n", h0.device_,
+                 h1.device_, timeout_ms);
+    return true;
+}
+
+bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    if (!stage_window(T, tokens, pos0, err)) return false;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    Verifier* peer = tp_half_ == 0 ? tp_peer_ : nullptr;
+    if (peer != nullptr) {   // the other half first: it runs to its first exchange and waits there
+        const OnDevice on(peer->device_);
+        if (!peer->stage_window(T, tokens, pos0, err)) return false;
+        const cudaError_t pe = cudaGraphLaunch(peer->exec_[T], peer->cs_);
+        if (pe != cudaSuccess) { err = std::string("verify: launch of half 1: ") + cudaGetErrorString(pe); return false; }
+        (void) cudaStreamQuery(peer->cs_);
+    }
     VDBG("staged; launching\n");
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
@@ -1074,6 +1147,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (tp_half_ >= 0) {   // a timed-out exchange summed garbage: refuse the window, loudly
+        uint32_t e0 = 0, e1 = 0;
+        cudaMemcpy(&e0, tp_ch_.err, 4, cudaMemcpyDeviceToHost);
+        if (peer != nullptr) {
+            const OnDevice on(peer->device_);
+            const cudaError_t ps = cudaStreamSynchronize(peer->cs_);
+            if (ps != cudaSuccess) { err = std::string("verify: half 1: ") + cudaGetErrorString(ps); return false; }
+            cudaMemcpy(&e1, peer->tp_ch_.err, 4, cudaMemcpyDeviceToHost);
+        }
+        if (e0 != 0 || e1 != 0) {
+            err = "verify: the tensor split's exchange timed out (" + std::to_string(e0) + " waits on half 0, " +
+                  std::to_string(e1) + " on half 1): the window is refused";
+            return false;
+        }
+    }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     if (dbg_on_) cudaMemcpy(dbg_h_.data(), dbg_, dbg_h_.size() * 8, cudaMemcpyDeviceToHost);
@@ -1245,6 +1333,10 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
+    if (tp_half_ == 0 && tp_peer_ != nullptr) {
+        const OnDevice on(tp_peer_->device_);
+        if (!tp_peer_->commit(n_keep, err)) return false;
+    }
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 

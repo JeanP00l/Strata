@@ -41,6 +41,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/tp_slice.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -324,6 +325,9 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// TENSOR SPLIT (tp_slice.hpp): every layer in two halves that add their partial sums.  "same": both halves on
+    /// this GPU, the speculative loop only (step 1 of the plan: the arithmetic, not the speed).  Empty: off.
+    std::string tensor_split;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -1075,6 +1079,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--tensor-split") o.tensor_split = next("--tensor-split");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
@@ -4845,20 +4850,73 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        // TENSOR SPLIT, step 1 ("same"): both halves on this GPU, each with the half geometry, its cut weights and
+        // its own session split from the prompt's state; half 0 then stands in for `ver`.  STRATA_TP_CHECK=1 also
+        // runs the whole-layer window on the same drafts and prints how the heads compare, window by window.
+        const bool tp = o.tensor_split == "same";
+        if (!o.tensor_split.empty() && !tp) {
+            std::fprintf(stderr, "strata generate: --tensor-split: only \"same\" (both halves on one GPU) so far\n");
+            return 2;
+        }
+        const bool tp_check = tp && std::getenv("STRATA_TP_CHECK") != nullptr;
+        strata::core::ModelGeometry gh;
+        strata::core::TpWeights tw[2];
+        strata::core::SessionState hs[2];
+        strata::core::Verifier vt[2];
+        std::vector<void*> tp_mem;
+        struct TpFree { std::vector<void*>& m; ~TpFree() { for (void* p : m) cudaFree(p); } } tp_free{tp_mem};
+        if (tp) {
+            if (o.spec_split || o.native_dense_gguf.empty()) {
+                std::fprintf(stderr, "strata generate: --tensor-split needs --native and no --spec-split\n");
+                return 2;
+            }
+            if (!strata::core::tp_half_geometry(g, gh, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 2; }
+            for (int c = 0; c < 2; ++c) {
+                void* sb = nullptr;
+                void* ps = nullptr;
+                if (!tw[c].build(wt, o.native_dense_gguf, g, c, err) ||
+                    cudaMalloc(&sb, strata::core::session_bytes(gh, o.max_context, K)) != cudaSuccess ||
+                    (tp_mem.push_back(sb), cudaMalloc(&ps, strata::core::ple_run_scratch_bytes()) != cudaSuccess)) {
+                    std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c,
+                                 err.empty() ? "out of device memory (raise --vram-reserve-mib)" : err.c_str());
+                    return 1;
+                }
+                tp_mem.push_back(ps);
+                if (strata::core::session_init(gh, o.max_context, K, sb, hs[c]) == 0 ||
+                    !strata::core::tp_split_state(g, ss, gh, hs[c], c, ps, tw[c].q8_1(), err)) {
+                    std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c, err.c_str());
+                    return 1;
+                }
+                vt[c].set_tensor_half(c, g.n_ff, true);
+                if (!vt[c].init(tw[c].table(), gh, hs[c], vh, c == 0 && native_head.loaded() ? &native_head : nullptr,
+                                o.spec, err)) {
+                    std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c, err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata generate: tensor split half %d: %zu tensors cut, %.1f MiB\n", c,
+                             tw[c].tensors(), (double) tw[c].bytes() / 1048576.0);
+            }
+            if (!strata::core::Verifier::tp_pair(vt[0], vt[1], err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        }
+        strata::core::Verifier& V = tp ? vt[0] : ver;
         const bool use_mtp = !o.mtp.empty();
-        if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+        if (use_mtp && !mtp.bind(wt, &native_head, V.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         ver.set_split(o.spec_split);
+        if (tp) V.set_sampling(sp);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
-        drive.d.plan = ver.plan_sink();
+        if (tp) V.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        drive.d.plan = V.plan_sink();
+        int64_t tpc_windows = 0, tpc_rows = 0, tpc_top1 = 0;
+        double tpc_maxd = 0.0;
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
@@ -5012,9 +5070,48 @@ int main(int argc, char** argv) {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            std::vector<int32_t> outc((size_t) T);
+            if (tp_check) {   // the whole-layer window on the same drafts, first
+                drive.d.plan = ver.plan_sink();
+                if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outc.data(), err)) {
+                    std::fprintf(stderr, "strata generate: check window: %s\n", err.c_str());
+                    return 1;
+                }
+                drive.d.plan = V.plan_sink();
+            }
+            if (!V.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                if (tp) { std::fflush(nullptr); std::_Exit(1); }   // a half may still spin: no teardown that waits on it
                 return 1;
+            }
+            if (tp_check) {
+                const size_t nv = (size_t) V.n_vocab();
+                std::vector<float> a((size_t) T * nv), b((size_t) T * nv);
+                cudaMemcpy(a.data(), ver.head_logits(0), a.size() * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(b.data(), V.head_logits(0), b.size() * 4, cudaMemcpyDeviceToHost);
+                std::string line;
+                for (int t = 0; t < T; ++t) {
+                    const float* x = a.data() + (size_t) t * nv;
+                    const float* y = b.data() + (size_t) t * nv;
+                    size_t ax = 0, by = 0;
+                    double md = 0.0;
+                    for (size_t v = 0; v < nv; ++v) {
+                        if (x[v] > x[ax]) ax = v;
+                        if (y[v] > y[by]) by = v;
+                        md = std::max(md, (double) std::fabs(x[v] - y[v]));
+                    }
+                    float second = -1e30f;   // the whole-layer head's margin between its top two
+                    for (size_t v = 0; v < nv; ++v) if (v != ax) second = std::max(second, x[v]);
+                    ++tpc_rows;
+                    tpc_top1 += ax == by;
+                    tpc_maxd = std::max(tpc_maxd, md);
+                    char buf[96];
+                    std::snprintf(buf, sizeof buf, " %s%zu/%zu d=%.3f m=%.2f", ax == by ? "" : "MISS:", ax, by, md,
+                                  (double) (x[ax] - second));
+                    line += buf;
+                }
+                ++tpc_windows;
+                std::fprintf(stderr, "strata tp check: pos %lld T %d:%s\n", (long long) p, T, line.c_str());
             }
             if (drive.d.failed) {
                 std::fprintf(stderr, "strata generate: the expert pool failed at layer %lld expert %lld: %s\n",
@@ -5034,7 +5131,7 @@ int main(int argc, char** argv) {
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-            if (!ver.commit(a + 1, err)) {
+            if (!V.commit(a + 1, err) || (tp_check && !ver.commit(a + 1, err))) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -5076,6 +5173,9 @@ int main(int argc, char** argv) {
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
+        if (tp_check)
+            std::fprintf(stderr, "strata tp check: %lld windows, %lld rows, top-1 the same in %lld, max |logit diff| %.4f\n",
+                         (long long) tpc_windows, (long long) tpc_rows, (long long) tpc_top1, tpc_maxd);
         if (o.spec_min_p > 0.0) {
             std::printf("%-24s", "window sizes");
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
@@ -5090,8 +5190,8 @@ int main(int argc, char** argv) {
         if (rounds > 0)
             std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
                         "distinct / %.2f routed per layer\n",
-                        "verify window", ver.ms_wait / rounds, ver.ms_pool / rounds, ver.ms_host / rounds,
-                        ver.ms_commit / rounds,
+                        "verify window", V.ms_wait / rounds, V.ms_pool / rounds, V.ms_host / rounds,
+                        V.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0)

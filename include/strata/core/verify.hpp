@@ -27,6 +27,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/tp_exchange.hpp"
 
 #include <cuda_runtime.h>
 
@@ -107,6 +108,20 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
+    /// TENSOR SPLIT (tp_slice.hpp): this verifier runs half `half` (0 or 1) of every layer, with the half geometry,
+    /// the half weight table and its own session, and adds its partial sums with the other half's inside the graph
+    /// (tp_exchange.hpp) after the mixer's out-projection and after the MoE.  Half 0 runs the routed experts (the
+    /// host pool is its) and the head; half 1 only its share of the dense layers.  `routed_ff` is the routed
+    /// experts' own ff width (the full model's: they are not cut here).  Set before `init`, then `tp_pair`.
+    /// `same_gpu`: both halves on this GPU - each gets a CU-masked stream (its own queue, half the CUs).
+    void set_tensor_half(int half, int64_t routed_ff, bool same_gpu) { tp_half_ = half; tp_ff_ = routed_ff; tp_same_ = same_gpu; }
+    /// Join two halves after both `init`s and before the first `run`: each side's receive buffers and flags,
+    /// uncached, on its own device.  Half 0's `run`/`commit` then drive half 1 as well.
+    static bool tp_pair(Verifier& h0, Verifier& h1, std::string& err);
+    /// The head's logits of the last window, row t (device), and the vocabulary size.
+    const float* head_logits(int t) const { return head_logits_ + (size_t) t * (size_t) n_vocab_; }
+    int64_t n_vocab() const { return n_vocab_; }
+
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
@@ -154,6 +169,16 @@ private:
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
+    // tensor split (set_tensor_half / tp_pair)
+    int tp_half_ = -1;                  ///< -1: the whole layer
+    int64_t tp_ff_ = 0;
+    bool tp_same_ = false;
+    Verifier* tp_peer_ = nullptr;
+    strata::kernels::TpChannel tp_ch_;
+    bool tp_routed() const { return tp_half_ <= 0; }   ///< runs the routed experts (and rings the host)
+    bool tp_head() const { return tp_half_ <= 0; }
+    /// Stage a window's inputs and capture its graphs (run's first half; a tensor split's half 1 needs only this).
+    bool stage_window(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     static constexpr int kProfPer = 32;              // stamps per layer
