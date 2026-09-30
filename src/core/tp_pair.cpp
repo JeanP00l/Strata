@@ -5,6 +5,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/tp_exchange.hpp"
 
 #include <cuda_runtime.h>
@@ -93,7 +94,7 @@ bool TpPair::halves_from_cache(const ModelGeometry& g, const std::vector<int32_t
 }
 
 bool TpPair::build(const WeightTable& wt, const std::vector<std::string>& shards, const ModelGeometry& g,
-                   const SessionState& ss, int64_t max_context, int64_t k, std::string& err) {
+                   const SessionState& ss, int64_t max_context, int64_t k, int64_t upto, std::string& err) {
     for (int c = 0; c < 2; ++c) {
         const OnDevice on(dev[c]);
         void* sb = nullptr;
@@ -116,7 +117,7 @@ bool TpPair::build(const WeightTable& wt, const std::vector<std::string>& shards
         mem_dev_.push_back(dev[c]);
         ple_scratch_[c] = ps;
         if (session_init(gh, max_context, k, sb, hs[c]) == 0 ||
-            !tp_split_state(g, ss, gh, hs[c], c, ps, tw[c].q8_1(), err)) {
+            !tp_split_state(g, ss, gh, hs[c], c, ps, tw[c].q8_1(), upto, err)) {
             err = "tensor split half " + std::to_string(c) + ": " + err;
             return false;
         }
@@ -142,6 +143,45 @@ bool TpPair::build(const WeightTable& wt, const std::vector<std::string>& shards
                 }
         }
     }
+    on_halves_ = true;
+    dirty_from_ = upto;
+    return true;
+}
+
+bool TpPair::copy(bool to_half, const ModelGeometry& g, SessionState& ss, int64_t p0, int64_t p1, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int c = 0; c < 2; ++c) {
+        const OnDevice on(dev[c]);
+        if (!tp_copy_state(to_half, g, ss, gh, hs[c], c, p0, p1, err)) return false;
+    }
+    // a streamed receiver: its host copy changed under blocks it may hold in VRAM - evict them all
+    for (int c = 0; c < 2; ++c) {
+        SessionState& r = to_half ? hs[c] : ss;
+        const OnDevice on(to_half ? dev[c] : dev[0]);
+        bool any = false;
+        for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+            if (r.qsa_states[i].kv_mode == 1) { strata::kernels::kv_stream_reset(r.qsa_states[i].map, nullptr); any = true; }
+        if (any && cudaDeviceSynchronize() != cudaSuccess) { err = "tensor split: evicting the streamed KV failed"; return false; }
+        if (!to_half) break;
+    }
+    ms_switch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++switches;
+    return true;
+}
+
+bool TpPair::use_halves(const ModelGeometry& g, SessionState& ss, int64_t pos, std::string& err) {
+    if (on_halves_) return true;
+    if (!copy(true, g, ss, dirty_from_, pos, err)) return false;
+    on_halves_ = true;
+    dirty_from_ = pos;
+    return true;
+}
+
+bool TpPair::use_full(const ModelGeometry& g, SessionState& ss, int64_t pos, std::string& err) {
+    if (!on_halves_) return true;
+    if (!copy(false, g, ss, dirty_from_, pos, err)) return false;
+    on_halves_ = false;
+    dirty_from_ = pos;
     return true;
 }
 

@@ -14,6 +14,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
@@ -245,6 +246,13 @@ struct Stager {
     }
 };
 
+// Tensor split: the whole-layer native projections in pinned host memory (`WeightRef::native_host`), each copied to
+// this one device buffer right before its GEMM, in stream order.  ~42 MB a layer at ~12 GB/s.
+struct HostStage {
+    void* buf = nullptr;
+    uint64_t bytes = 0;
+};
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -256,6 +264,7 @@ struct Prefill::Impl {
     bool borrowed = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
+    HostStage hstage;   // tensor split: the whole-layer projections live in host memory, copied here per GEMM
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
@@ -489,6 +498,17 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_host.resize((size_t) chunk);
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    if (m.hstage.buf == nullptr) {   // tensor split: a staging buffer for the largest projection in host memory
+        uint64_t big = 0;
+        for (const auto& [name, ref] : wt.all())
+            if (ref.native_data != nullptr && ref.native_host)
+                big = std::max<uint64_t>(big, strata::kernels::native_mmvq_weight_bytes(ref.native_type, (int) ref.ne0, (int) ref.ne1));
+        if (big > 0) {
+            if (cudaMalloc(&m.hstage.buf, big) != cudaSuccess) { err = "prefill: the host projections' staging buffer"; return false; }
+            m.owned.push_back(m.hstage.buf);
+            m.hstage.bytes = big;
+        }
+    }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -864,10 +884,19 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
-bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0) {
+bool native_proj(Gemm& gm, HostStage& hs, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T,
+                 const std::string& name, std::string& err, int64_t ldy = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
-    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
+    const void* W = w->native_data;
+    if (w->native_host) {   // tensor split: copy the whole-layer tensor to the card first (same stream: in order)
+        const uint64_t b = strata::kernels::native_mmvq_weight_bytes(w->native_type, (int) w->ne0, (int) w->ne1);
+        if (b > hs.bytes || cudaMemcpyAsync(hs.buf, W, b, cudaMemcpyHostToDevice, (cudaStream_t) gm.stream()) != cudaSuccess) {
+            err = "prefill: " + name + ": copying the host projection to the card failed";
+            return false;
+        }
+        W = hs.buf;
+    }
+    gm.native(X, w->native_type, W, Y, T, w->ne1, w->ne0, ldy);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -1272,8 +1301,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
@@ -1282,7 +1311,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdnRec, cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
                     pt.mark(kPfGdnOut, cs);
-                    if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -1296,9 +1325,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
-                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
@@ -1477,7 +1506,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (st.kv_q4 || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
@@ -1491,10 +1520,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                     swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, m.hstage, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host

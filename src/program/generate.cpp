@@ -1512,12 +1512,18 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        // a tensor split on two GPUs: the halves hold their own cuts, so the whole-layer projections (read only by
+        // the prompt path) wait in pinned host memory instead of taking ~2 GiB of GPU 0
+        const bool host = o.tensor_split == "pair";
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, host)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights\n",
-                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0));
+        std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights (%.2f MiB in host "
+                             "memory, the largest %.1f MiB)\n",
+                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0),
+                     (double) native_dense.host_bytes() / (1024.0 * 1024.0),
+                     (double) native_dense.largest_host() / (1024.0 * 1024.0));
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
@@ -3325,8 +3331,34 @@ int main(int argc, char** argv) {
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
-            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
+        // TENSOR SPLIT: half c of every layer on GPU c (the speculative loop's `pair`).  The prompt path keeps the full
+        // session on GPU 0, the windows run the halves; TpPair copies the state at every switch between the two.  No
+        // whole-layer verifier: half 0 stands in for it (and drives half 1).
+        const bool tp = !o.tensor_split.empty();
+        strata::core::TpPair tpp;
+        if (tp) {
+            const char* why = o.tensor_split != "pair" ? "only \"pair\" (GPUs 0 and 1) serves"
+                              : n_stages > 1 || multi_gpu   ? "not with --layer-split (a split is one or the other)"
+                              : o.native_dense_gguf.empty() ? "needs --native"
+                              : o.spec_split                ? "not with --spec-split"
+                              : o.pcie_frac > 0.0           ? "does not divide the PCIe share: --pcie-frac 0"
+                              : o.vision                    ? "no pictures yet (--vision no)"
+                                                            : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: --tensor-split: %s\n", why);
+                return 2;
+            }
+            if (!tpp.open(g, true, true, err) || !tpp.build(wt, o.native_dense_gguf, g, ss, o.max_context, K, 0, err) ||
+                !tpp.own_cache(g, *srcp, o.expert_profile, o.vram_reserve_mib, err) ||
+                !tpp.init_verifiers(g, vh, host_res, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                std::fprintf(stderr, "strata serve: tensor split: %s\n", err.c_str());
+                return 1;
+            }
+            drive.d.host_res = tpp.res.data();
+        }
+        strata::core::Verifier& V = tp ? tpp.vt[0] : ver;
+        if ((!tp && !ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) ||
+            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, V.final_R_all(), err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -4889,20 +4921,9 @@ int main(int argc, char** argv) {
             }
             if (!tpp.open(g, tp_pair_gpus, tp_own, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 2; }
             if ((!tp_own && !tpp.halves_from_cache(g, host_res, xcache, err)) ||
-                !tpp.build(wt, o.native_dense_gguf, g, ss, o.max_context, K, err)) {
+                !tpp.build(wt, o.native_dense_gguf, g, ss, o.max_context, K, spec_pos, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
-            }
-            if (tp_own && std::getenv("STRATA_TP_FREE_FULL") && std::getenv("STRATA_TP_FREE_FULL")[0] == '1') {
-                // an experiment until the prompt path runs split (step 4): the whole-layer native projections are
-                // needed only by the prompt path, which has run - free what half 0 does not share, for more experts
-                std::set<const void*> keep;
-                for (const auto& [name, ref] : tpp.tw[0].table().all())
-                    if (ref.native_data) keep.insert(ref.native_data);
-                const strata::core::OnDevice on(tpp.dev[0]);
-                const uint64_t freed = native_dense.release_except(keep);
-                std::fprintf(stderr, "strata generate: tensor split pair: %.2f GiB of whole-layer projections freed on GPU 0 "
-                                     "(STRATA_TP_FREE_FULL: no prompt path after this)\n", (double) freed / 1073741824.0);
             }
             if (tp_own) {
                 if (!tpp.own_cache(g, *srcp, o.expert_profile, o.vram_reserve_mib, err)) {
@@ -5086,6 +5107,9 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+        // STRATA_TP_STATE_CHECK=N: every N rounds, the state to the full session and all of it back (the text must
+        // not change)
+        const int tp_state_check = tp && std::getenv("STRATA_TP_STATE_CHECK") ? std::atoi(std::getenv("STRATA_TP_STATE_CHECK")) : 0;
         while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = S_mtp;
@@ -5122,6 +5146,13 @@ int main(int argc, char** argv) {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
+            if (tp_state_check > 0 && rounds > 0 && rounds % tp_state_check == 0) {
+                // the round trip the server makes: the halves' state into the full session, then every position back
+                if (!tpp.use_full(g, ss, p, err) || (tpp.full_rewound(0), !tpp.use_halves(g, ss, p, err))) {
+                    std::fprintf(stderr, "strata generate: STRATA_TP_STATE_CHECK: %s\n", err.c_str());
+                    return 1;
+                }
+            }
             std::vector<int32_t> outc((size_t) T);
             if (tp_check) {   // the whole-layer window on the same drafts, first
                 drive.d.plan = ver.plan_sink();
@@ -5263,6 +5294,9 @@ int main(int argc, char** argv) {
             const std::string pr = V.profile_report();
             if (!pr.empty()) std::fprintf(stderr, "strata verify profile:%s\n", pr.c_str());
         }
+        if (tp && tpp.switches > 0)
+            std::fprintf(stderr, "strata tp state: %lld switches, %.2f ms each\n", (long long) tpp.switches,
+                         tpp.ms_switch / (double) tpp.switches);
         if (tp && tpp.swapped > 0)
             std::fprintf(stderr, "strata tp swaps: %lld experts in %lld batches, per expert %.3f ms halves on GPU 0 (%.3f ms "
                                  "half 1 on GPU 1); %lld page ranges left unregistered, %lld halves verified\n",

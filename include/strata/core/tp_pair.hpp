@@ -37,8 +37,9 @@ public:
                            std::string& err);
     /// Each half's cut weights, replicas (GPU 1), session (half geometry) and PLE workspaces; the sessions split from
     /// `ss` (every position).
+    /// `upto`: the positions `ss` holds (the halves start current, from there on).
     bool build(const WeightTable& wt, const std::vector<std::string>& shards, const ModelGeometry& g,
-               const SessionState& ss, int64_t max_context, int64_t k, std::string& err);
+               const SessionState& ss, int64_t max_context, int64_t k, int64_t upto, std::string& err);
     /// Own: as many halves as the tighter card holds after `reserve_mib`, ranked by the profile, filled from `src`
     /// (the arena's pages of what is now in VRAM are released).  `res` is then the table the pool reads.
     bool own_cache(const ModelGeometry& g, ExpertSource& src, const std::string& profile, int64_t reserve_mib,
@@ -57,6 +58,18 @@ public:
     bool fills_done(bool wait);
     /// Every half of `fills` byte for byte against its blob (STRATA_TP_VERIFY_SWAPS).
     bool verify(const std::vector<std::pair<int32_t, const uint8_t*>>& fills, std::string& err);
+
+    /// WHO HOLDS THE STATE.  The prompt path writes the full session `ss`, the verify windows the halves.  Before a
+    /// window: `use_halves(pos)`; before the prompt path, a checkpoint, a restore or the end of a request:
+    /// `use_full(pos)`.  Each switch copies the running state and the positions written since the last switch
+    /// (tp_copy_state); `pos` is where the writer that is about to run starts.  After the full session was rewound
+    /// (session_zero, checkpoint_restore) with the full session current: `full_rewound(pos)`.
+    bool use_halves(const ModelGeometry& g, SessionState& ss, int64_t pos, std::string& err);
+    bool use_full(const ModelGeometry& g, SessionState& ss, int64_t pos, std::string& err);
+    void full_rewound(int64_t pos) { if (!on_halves_ && pos < dirty_from_) dirty_from_ = pos; }
+    bool on_halves() const { return on_halves_; }
+    double ms_switch = 0;   ///< time in the switches
+    int64_t switches = 0;
 
     bool pair = false, own = false;
     int dev[2] = {0, 0};
@@ -77,6 +90,9 @@ private:
     void* stream1_ = nullptr;
     void* ev_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};   ///< [gpu][begin/end] of the batch in flight
     int64_t in_flight_ = 0;
+    bool on_halves_ = true;
+    int64_t dirty_from_ = 0;
+    bool copy(bool to_half, const ModelGeometry& g, SessionState& ss, int64_t p0, int64_t p1, std::string& err);
 };
 
 }  // namespace strata::core

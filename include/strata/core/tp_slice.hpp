@@ -119,11 +119,24 @@ private:
 std::vector<int32_t> tp_slot_layers(const std::vector<int32_t>& host_res, int64_t n_layers, int64_t n_expert,
                                     int64_t n_slots);
 
-/// Copy the full session's state into half c's session (session_init'ed with the half geometry): the GDN
-/// recurrence and conv history of this half's heads/channels, the QSA KV of its kv head, the indexer state, the
-/// PLE history and window, the residual.  The PLE run is wired to the half's own history and `ple_scratch` /
-/// `ple_q8_1` (the PLE block's workspaces - two halves running at once cannot share them).  Synchronous.
+/// Half c's session reads the full session's PLE weights and constants, with its own history, token window and
+/// workspaces (`ple_scratch` / `ple_q8_1` - two halves running at once cannot share them).  Once, after session_init.
+void tp_wire_half(const SessionState& full, SessionState& half, void* ple_scratch, void* ple_q8_1);
+
+/// THE STATE BETWEEN THE FULL SESSION AND A HALF.  The prompt path writes the full session, the windows the halves,
+/// so every switch between them copies what the writer changed:
+///   * RUNNING state, whole: the GDN recurrences and conv histories of this half's heads/channels, the indexer's
+///     tail, dead key and block position, the residual, the PLE history and token window;
+///   * POSITIONAL state, positions [p0, p1) only: the KV of this half's kv head (whole blocks) and the indexer's
+///     pooled rows.  A streamed state's copy is its HOST copy (the authoritative one): the caller then evicts the
+///     receiving state's resident blocks (`kv_stream_reset`), whose slots the copy did not touch.
+/// `to_half` false copies back; the replicated parts (residual, indexer, PLE) come back from half 0 only.  Either
+/// direction may cross GPUs (peer access on).  Synchronous (the current device).
+bool tp_copy_state(bool to_half, const ModelGeometry& g, SessionState& full, const ModelGeometry& gh, SessionState& half,
+                   int c, int64_t p0, int64_t p1, std::string& err);
+
+/// `tp_wire_half` + `tp_copy_state` to the half for positions [0, upto).
 bool tp_split_state(const ModelGeometry& g, const SessionState& full, const ModelGeometry& gh, SessionState& half,
-                    int c, void* ple_scratch, void* ple_q8_1, std::string& err);
+                    int c, void* ple_scratch, void* ple_q8_1, int64_t upto, std::string& err);
 
 }  // namespace strata::core

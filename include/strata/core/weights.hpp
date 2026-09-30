@@ -90,6 +90,9 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
+    /// Tensor split: `native_data` is pinned (mapped) HOST memory, not VRAM - the prompt path copies it to the card
+    /// before its GEMM (a kernel reading it in place would cross PCIe on every access).
+    bool native_host = false;
     /// Plan v0.3 P1: false when the loader SKIPPED this tensor's canonical bytes because another form serves it
     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
     bool resident = true;

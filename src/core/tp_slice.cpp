@@ -182,6 +182,7 @@ bool TpWeights::build(const WeightTable& full, const std::vector<std::string>& s
                 void* dev = nullptr;
                 if (!upload(host.data(), host.size(), &dev)) { err += " (" + t.name + ")"; return false; }
                 ref.native_data = dev;
+                ref.native_host = false;
                 ref.native_q8_1 = q8_1_;
                 ref.ne0 = out0;
                 ref.ne1 = out1;
@@ -235,8 +236,11 @@ bool TpWeights::build(const WeightTable& full, const std::vector<std::string>& s
         ++cut_;
     }
     // every other native projection (the PLE key) keeps the full data but uses this half's scratch
-    for (auto& [name, ref] : table_.table_)
-        if (ref.native_data && !done.count(name)) ref.native_q8_1 = q8_1_;
+    for (auto& [name, ref] : table_.table_) {
+        if (!ref.native_data || done.count(name)) continue;
+        if (ref.native_host) { err = "tensor split: " + name + " is in host memory and not cut (the window would read it over PCIe)"; return false; }
+        ref.native_q8_1 = q8_1_;
+    }
     return true;
 }
 
@@ -283,90 +287,123 @@ const void* TpWeights::local(const void* p) const {
     return it == rep_.end() ? p : it->second;
 }
 
-bool tp_split_state(const ModelGeometry& g, const SessionState& f, const ModelGeometry& gh, SessionState& h, int c,
-                    void* ple_scratch, void* ple_q8_1, std::string& err) {
+void tp_wire_half(const SessionState& f, SessionState& h, void* ple_scratch, void* ple_q8_1) {
+    h.k = f.k;
+    if (!f.ple.ready()) return;
+    h.ple = f.ple;
+    h.ple.hist = h.ple_hist;
+    h.ple.token = &h.ple_token;
+    h.ple.prev = h.ple_prev;
+    h.ple.scratch = (float*) ple_scratch;
+    if (h.ple.w.key_native_data != nullptr) h.ple.w.key_native_q8_1 = ple_q8_1;
+}
+
+bool tp_copy_state(bool to_half, const ModelGeometry& g, SessionState& f, const ModelGeometry& gh, SessionState& h,
+                   int c, int64_t p0, int64_t p1, std::string& err) {
     auto ok = [&](cudaError_t e, const char* what) {
         if (e == cudaSuccess) return true;
-        err = std::string("tensor split state (") + what + "): " + cudaGetErrorString(e);
+        err = std::string("tensor split state (") + what + (to_half ? ", to a half): " : ", to the full session): ") +
+              cudaGetErrorString(e);
         return false;
     };
+    // a copy between the full session's and the half's layout: `cp(full, half, ...)` moves full -> half or back
+    auto cp2 = [&](void* full, size_t fpitch, void* half, size_t hpitch, size_t width, size_t rows, const char* what) {
+        if (rows == 0 || width == 0) return true;
+        return to_half ? ok(cudaMemcpy2DAsync(half, hpitch, full, fpitch, width, rows, cudaMemcpyDefault, nullptr), what)
+                       : ok(cudaMemcpy2DAsync(full, fpitch, half, hpitch, width, rows, cudaMemcpyDefault, nullptr), what);
+    };
+    auto cp = [&](void* full, void* half, size_t bytes, const char* what) {
+        return cp2(full, bytes, half, bytes, bytes, 1, what);
+    };
+    const bool shared = c == 0 || to_half;   // replicated state goes back from half 0 only
     const int64_t S = g.ssm_state_size;
     const uint64_t ff = (uint64_t) S * g.ssm_v_heads * S + (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const uint64_t fh = (uint64_t) S * gh.ssm_v_heads * S + (uint64_t) gh.ssm_conv_channels * (gh.ssm_d_conv - 1);
     const auto vheads = tp_gdn_vheads(g, c);
     const auto chans = tp_gdn_channels(g, c);
     const int64_t d3 = g.ssm_d_conv - 1;
-    // ---- GDN: the recurrence (S, h_v, S) by value head, the conv history [C][3] by channel
+    // ---- RUNNING: GDN recurrence (S, h_v, S) by value head, the conv history [C][3] by channel
     for (int64_t gi = 0; gi < g.n_gdn_layers(); ++gi) {
-        const float* fs = f.gdn_state + (size_t) gi * ff;
+        float* fs = f.gdn_state + (size_t) gi * ff;
         float* hs = h.gdn_state + (size_t) gi * fh;
         int64_t at = 0;
         for (const auto& v : vheads) {
-            if (!ok(cudaMemcpy2DAsync(hs + at * S, (size_t) gh.ssm_v_heads * S * 4, fs + v.begin * S, (size_t) g.ssm_v_heads * S * 4,
-                                 (size_t) (v.end - v.begin) * S * 4, (size_t) S, cudaMemcpyDeviceToDevice, nullptr), "gdn state"))
+            if (!cp2(fs + v.begin * S, (size_t) g.ssm_v_heads * S * 4, hs + at * S, (size_t) gh.ssm_v_heads * S * 4,
+                     (size_t) (v.end - v.begin) * S * 4, (size_t) S, "gdn state"))
                 return false;
             at += v.end - v.begin;
         }
-        const float* fc = fs + (size_t) S * g.ssm_v_heads * S;
+        float* fc = fs + (size_t) S * g.ssm_v_heads * S;
         float* hc = hs + (size_t) S * gh.ssm_v_heads * S;
         at = 0;
         for (const auto& r : chans) {
-            if (!ok(cudaMemcpy(hc + at * d3, fc + r.begin * d3, (size_t) (r.end - r.begin) * d3 * 4, cudaMemcpyDeviceToDevice),
-                    "conv history"))
-                return false;
+            if (!cp(fc + r.begin * d3, hc + at * d3, (size_t) (r.end - r.begin) * d3 * 4, "conv history")) return false;
             at += r.end - r.begin;
         }
     }
-    // ---- QSA: the kv head's rows of every page, [page][kv_head][page_size][...]; the indexer as it is
-    const int64_t page = strata::kernels::qsa_real_shapes().page_size, HD = g.head_dim;
+    // ---- QSA.  POSITIONAL: the kv head's rows of blocks [p0, p1), [block][kv_head][page_size][...] - from the
+    // host copy of a streamed state (the authoritative one), the pool of a resident one.  The indexer: RUNNING (tail,
+    // dead key, block position) whole, POSITIONAL (pooled rows) for the same blocks.
+    const strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    const int64_t page = s.page_size, HD = g.head_dim;
     const int64_t NKV = g.n_head_kv, NKVh = gh.n_head_kv;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
-        const QsaState& a = f.qsa_states[i];
+        QsaState& a = f.qsa_states[i];
         QsaState& b = h.qsa_states[i];
-        if (a.kv_mode != 0 || b.kv_mode != 0 || a.kv_q4 || a.kv_hybrid || a.kv_int8 != b.kv_int8 || a.n_slots != b.n_slots) {
-            err = "tensor split: only resident FP16 or INT8 KV splits (not streamed, Q4 or K8V4)";
+        if (a.kv_q4 || a.kv_hybrid || a.kv_int8 != b.kv_int8 || a.n_pages != b.n_pages || a.kv_mode == 2 || b.kv_mode == 2) {
+            err = "tensor split: only FP16 or INT8 KV splits (not Q4 or K8V4), with the same page count";
             return false;
         }
-        auto rows = [&](const void* src, void* dst, uint64_t row_bytes, const char* what) {
-            const size_t w = (size_t) (page * NKVh) * row_bytes, sp = (size_t) (page * NKV) * row_bytes;
-            return ok(cudaMemcpy2DAsync(dst, w, (const uint8_t*) src + (size_t) c * w, sp, w, (size_t) a.n_slots,
-                                   cudaMemcpyDeviceToDevice, nullptr), what);
+        const int64_t b0 = std::max<int64_t>(0, p0 / page), b1 = std::min<int64_t>(a.n_pages, (p1 + page - 1) / page);
+        auto rows = [&](void* fsrc, void* fhost, void* hsrc, void* hhost, uint64_t row_bytes, const char* what) {
+            const size_t w = (size_t) (page * NKVh) * row_bytes, fp = (size_t) (page * NKV) * row_bytes;
+            uint8_t* fb = (uint8_t*) (a.kv_mode == 1 ? fhost : fsrc);
+            uint8_t* hb = (uint8_t*) (b.kv_mode == 1 ? hhost : hsrc);
+            if (fb == nullptr || hb == nullptr) { err = std::string("tensor split state: no ") + what + " pool"; return false; }
+            return b1 <= b0 || cp2(fb + (size_t) b0 * fp + (size_t) c * w, fp, hb + (size_t) b0 * w, w, w, (size_t) (b1 - b0), what);
         };
         if (a.kv_int8) {
             const uint64_t sc = (uint64_t) (HD / strata::kernels::KV_Q8_GROUP) * 2;
-            if (!rows(a.k_q, b.k_q, (uint64_t) HD, "k") || !rows(a.v_q, b.v_q, (uint64_t) HD, "v") ||
-                !rows(a.k_scale, b.k_scale, sc, "k scale") || !rows(a.v_scale, b.v_scale, sc, "v scale"))
+            if (!rows(a.k_q, a.host.k_q, b.k_q, b.host.k_q, (uint64_t) HD, "k") ||
+                !rows(a.v_q, a.host.v_q, b.v_q, b.host.v_q, (uint64_t) HD, "v") ||
+                !rows(a.k_scale, a.host.k_scale, b.k_scale, b.host.k_scale, sc, "k scale") ||
+                !rows(a.v_scale, a.host.v_scale, b.v_scale, b.host.v_scale, sc, "v scale"))
                 return false;
-        } else if (!rows(a.k_pool, b.k_pool, (uint64_t) HD * 2, "k") || !rows(a.v_pool, b.v_pool, (uint64_t) HD * 2, "v")) {
+        } else if (!rows(a.k_pool, a.host.k_pool, b.k_pool, b.host.k_pool, (uint64_t) HD * 2, "k") ||
+                   !rows(a.v_pool, a.host.v_pool, b.v_pool, b.host.v_pool, (uint64_t) HD * 2, "v")) {
             return false;
         }
-        const strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-        if (a.idx_pooled_rows != b.idx_pooled_rows || a.n_pages != b.n_pages) { err = "tensor split: indexer sizes differ"; return false; }
-        if (!ok(cudaMemcpy(b.page_table, a.page_table, (size_t) a.n_pages * 4, cudaMemcpyDeviceToDevice), "page table") ||
-            !ok(cudaMemcpy(b.idx_tail, a.idx_tail, (size_t) (s.idx_block - 1) * g.idx_key_dim * 4, cudaMemcpyDeviceToDevice), "tail") ||
-            !ok(cudaMemcpy(b.idx_dead, a.idx_dead, (size_t) g.idx_key_dim * 4, cudaMemcpyDeviceToDevice), "dead") ||
-            !ok(cudaMemcpy(b.idx_pooled, a.idx_pooled, (size_t) a.idx_pooled_rows * g.idx_key_dim * 4, cudaMemcpyDeviceToDevice),
-                "pooled") ||
-            !ok(cudaMemcpy(b.idx_block_pos, a.idx_block_pos, 4, cudaMemcpyDeviceToDevice), "block pos"))
+        if (!shared) continue;
+        if (a.idx_pooled_rows != b.idx_pooled_rows) { err = "tensor split: indexer sizes differ"; return false; }
+        const int64_t r0 = std::max<int64_t>(0, p0 / s.idx_block);
+        const int64_t r1 = std::min<int64_t>(a.idx_pooled_rows, (p1 + s.idx_block - 1) / s.idx_block + 2);
+        const size_t row = (size_t) g.idx_key_dim * 4;
+        if (!cp(a.idx_tail, b.idx_tail, (size_t) (s.idx_block - 1) * row, "tail") ||
+            !cp(a.idx_dead, b.idx_dead, row, "dead") ||
+            (r1 > r0 && !cp((uint8_t*) a.idx_pooled + (size_t) r0 * row, (uint8_t*) b.idx_pooled + (size_t) r0 * row,
+                            (size_t) (r1 - r0) * row, "pooled")) ||
+            !cp(a.idx_block_pos, b.idx_block_pos, 4, "block pos"))
             return false;
     }
-    // ---- the residual and the PLE: its history, window and its own workspaces
-    if (!ok(cudaMemcpy(h.R, f.R, (size_t) g.hc * g.n_embd * 4, cudaMemcpyDeviceToDevice), "residual")) return false;
-    h.k = f.k;
-    h.ple_prev[0] = f.ple_prev[0];
-    h.ple_prev[1] = f.ple_prev[1];
-    h.ple_token = f.ple_token;
-    if (f.ple.ready()) {
-        const uint64_t hist = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4;
-        if (!ok(cudaMemcpy(h.ple_hist, f.ple.hist, hist, cudaMemcpyDeviceToDevice), "ple history")) return false;
-        h.ple = f.ple;
-        h.ple.hist = h.ple_hist;
-        h.ple.token = &h.ple_token;
-        h.ple.prev = h.ple_prev;
-        h.ple.scratch = (float*) ple_scratch;
-        if (h.ple.w.key_native_data != nullptr) h.ple.w.key_native_q8_1 = ple_q8_1;
+    // ---- RUNNING, replicated: the residual, the PLE history and token window
+    if (shared) {
+        if (!cp(f.R, h.R, (size_t) g.hc * g.n_embd * 4, "residual")) return false;
+        if (f.ple_hist != nullptr && h.ple_hist != nullptr &&
+            !cp(f.ple_hist, h.ple_hist, (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4, "ple history"))
+            return false;
+        SessionState& dst = to_half ? h : f;
+        const SessionState& src = to_half ? f : h;
+        dst.ple_prev[0] = src.ple_prev[0];
+        dst.ple_prev[1] = src.ple_prev[1];
+        dst.ple_token = src.ple_token;
     }
     return ok(cudaDeviceSynchronize(), "sync");
+}
+
+bool tp_split_state(const ModelGeometry& g, const SessionState& f, const ModelGeometry& gh, SessionState& h, int c,
+                    void* ple_scratch, void* ple_q8_1, int64_t upto, std::string& err) {
+    tp_wire_half(f, h, ple_scratch, ple_q8_1);
+    return tp_copy_state(true, g, const_cast<SessionState&>(f), gh, h, c, 0, upto, err);
 }
 
 // ---------------------------------------------------------------- the routed experts' halves
