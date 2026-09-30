@@ -10,6 +10,6 @@ for f in build-hip/*_parity build-hip/strata-device build-hip/strata-gguf; do cp
 cp -r serve tools data chat.py LICENSE "$T/strata/"
 cp -r third_party/llama.cpp/gguf-py "$T/strata/third_party/llama.cpp/"
 mkdir -p "$T/strata/llama" && cp -a third_party/llama.cpp/build-hip/bin/. "$T/strata/llama/"
-cp docker/strata-gfx906.Dockerfile "$T/strata/docker/"
+cp docker/*.Dockerfile "$T/strata/docker/"
 git rev-parse --short HEAD > "$T/strata/VERSION.git"
 tar -C "$T" -cf - strata
