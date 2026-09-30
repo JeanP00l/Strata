@@ -187,6 +187,7 @@ class StrataEngine:
         loading.set()
         if self.max_context <= 0:
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
@@ -228,15 +229,33 @@ class StrataEngine:
         except subprocess.TimeoutExpired:
             return None
 
-    def restart(self):
-        """Start the engine again (the same command) after it died; the new process has its own line queue."""
+    def restart(self, tries: int = 3):
+        """Start the engine again (the same command) after it died; the new process has its own line queue.
+        The old process is waited for first - its GPU memory is freed only when it is gone, and a new engine
+        started next to it runs out of VRAM and exits before it is ready - and a failed start is retried."""
         try:
             self.proc.kill()
         except OSError:
             pass
+        try:
+            self.proc.wait(timeout=120)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         info = dict(self.info)
-        self.ended = False
-        self.__init__(*self.spawn)
+        for i in range(tries):
+            self.ended = False
+            try:
+                self.__init__(*self.spawn)
+                break
+            except RuntimeError:
+                try:
+                    self.proc.wait(timeout=60)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                if i == tries - 1:
+                    raise
+                print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in 15 s", flush=True)
+                time.sleep(15)
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -749,16 +768,19 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        room = self.engine.max_context - CTX_SLACK - len(ids)
+        # a failed restart leaves max_context 0: check against the last known context, so the request reaches
+        # run() - which starts the engine again - instead of failing with "exceeds the context (0)" forever
+        ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+        room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                                 f"({ctx}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                                 f"({ctx}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 

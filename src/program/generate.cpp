@@ -3485,7 +3485,9 @@ int main(int argc, char** argv) {
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
+            static const auto t0 = std::chrono::steady_clock::now();   // ms since the first trace line: where time goes
+            std::fprintf(stderr, "strata trace: %9.0f ms %s %lld %lld\n",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), what, a, b);
             std::fflush(stderr);
         };
         {
