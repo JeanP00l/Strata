@@ -546,6 +546,8 @@ namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     unsigned long long t;
 #if defined(STRATA_HIP)
     t = wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz (hipDeviceAttributeWallClockRate) -> ns
+#elif defined(__HIPCC__)
+    t = wall_clock64() * 10ull;   // gfx11: a constant 100 MHz counter, in ns
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 #endif
