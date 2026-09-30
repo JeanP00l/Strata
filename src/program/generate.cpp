@@ -42,6 +42,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/tp_slice.hpp"
+#include "strata/core/tp_pair.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -4864,7 +4865,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --tensor-split: \"same\" (both halves on one GPU) or \"pair\" (GPUs 0 and 1)\n");
             return 2;
         }
-        const int tp_dev[2] = {0, tp_pair_gpus ? 1 : 0};
         // Two GPUs hold NO full expert cache: each holds half of every cached expert, as many as the tighter card
         // fits after everything else (--vram-reserve-mib left free on each), ranked by the profile, filled from the
         // host arena.  The full cache (--expert-cache, keep it small) then serves only the prompt path, and the
@@ -4877,221 +4877,46 @@ int main(int argc, char** argv) {
                                  "window reads the full cache)\n");
             return 2;
         }
-        strata::core::ModelGeometry gh;
-        strata::core::TpWeights tw[2];
-        strata::core::TpExpertHalves th[2];
-        strata::core::SessionState hs[2];
-        strata::core::Verifier vt[2];
-        std::vector<void*> tp_mem;
-        struct TpFree { std::vector<void*>& m; ~TpFree() { for (void* p : m) cudaFree(p); } } tp_free{tp_mem};
-        std::vector<int32_t> tp_res;   // (layer, expert) -> slot of the halves' own cache
-        auto tp_own_cache = [&]() -> bool {
-            std::vector<std::pair<int32_t, int32_t>> ranked;
-            int64_t pslots = 0;
-            if (o.expert_profile.empty() ||
-                !strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, ranked, pslots, err)) {
-                std::fprintf(stderr, "strata generate: tensor split pair: %s\n", o.expert_profile.empty() ? "needs --expert-profile" : err.c_str());
-                return false;
-            }
-            const auto& lay = strata::kernels::cpu::expert_layout();
-            int64_t budget = INT64_MAX;
-            for (int c = 0; c < 2; ++c) {
-                const strata::core::OnDevice on(tp_dev[c]);
-                size_t fb = 0, tb = 0;
-                cudaMemGetInfo(&fb, &tb);
-                budget = std::min<int64_t>(budget, (int64_t) fb - ((int64_t) o.vram_reserve_mib << 20));
-                std::fprintf(stderr, "strata generate: tensor split pair: GPU %d has %.2f GiB free\n", tp_dev[c],
-                             (double) fb / 1073741824.0);
-            }
-            std::vector<int32_t> sl;
-            int64_t used = 0;
-            for (const auto& pr : ranked) {
-                const int64_t b = ((int64_t) lay.blob_bytes(pr.first) / 2 + 255) / 256 * 256;
-                if (used + b > budget) break;
-                used += b;
-                sl.push_back(pr.first);
-            }
-            if (sl.empty()) { std::fprintf(stderr, "strata generate: tensor split pair: no room for experts\n"); return false; }
-            tp_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
-            for (size_t i = 0; i < sl.size(); ++i)
-                tp_res[(size_t) ranked[i].first * (size_t) g.n_expert + (size_t) ranked[i].second] = (int32_t) i;
-            const Clock::time_point t0 = Clock::now();
-            for (int c = 0; c < 2; ++c) {
-                const strata::core::OnDevice on(tp_dev[c]);
-                if (!th[c].open(sl, c, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return false; }
-            }
-            for (size_t i = 0; i < sl.size(); ++i) {
-                const uint8_t* b = srcp->blob(ranked[i].first, ranked[i].second);
-                for (int c = 0; c < 2; ++c) {
-                    const strata::core::OnDevice on(tp_dev[c]);
-                    if (b == nullptr || !th[c].fill_staged((int32_t) i, b, nullptr, err)) {
-                        std::fprintf(stderr, "strata generate: tensor split pair: fill of slot %zu: %s\n", i,
-                                     b == nullptr ? "no blob" : err.c_str());
-                        return false;
-                    }
-                }
-                if ((i & 63) == 63)   // the ring is reused in stream order; keep the host from running far ahead
-                    for (int c = 0; c < 2; ++c) { const strata::core::OnDevice on(tp_dev[c]); cudaStreamSynchronize(nullptr); }
-            }
-            for (int c = 0; c < 2; ++c) {
-                const strata::core::OnDevice on(tp_dev[c]);
-                if (cudaDeviceSynchronize() != cudaSuccess) {
-                    std::fprintf(stderr, "strata generate: tensor split pair: the fill failed on GPU %d\n", tp_dev[c]);
-                    return false;
-                }
-            }
-            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            for (size_t i : {(size_t) 0, sl.size() - 1})
-                if (!th[0].verify_slot((int32_t) i, srcp->blob(ranked[i].first, ranked[i].second), err) ||
-                    !th[1].verify_slot((int32_t) i, srcp->blob(ranked[i].first, ranked[i].second), err)) {
-                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                    return false;
-                }
-            uint64_t released = 0;   // in VRAM now: the arena's pages are not needed
-            for (size_t i = 0; i < sl.size(); ++i) released += srcp->release(ranked[i].first, ranked[i].second);
-            drive.d.host_res = tp_res.data();
-            std::fprintf(stderr, "strata generate: tensor split pair: %zu experts halved (%.1f%% of %lld), 2 x %.2f GiB, "
-                                 "filled from the host arena in %.0f ms, %.2f GiB of arena released; first and last verified\n",
-                         sl.size(), 100.0 * (double) sl.size() / (double) (g.n_layers * g.n_expert),
-                         (long long) (g.n_layers * g.n_expert), (double) used / 1073741824.0, ms,
-                         (double) released / 1073741824.0);
-            return true;
-        };
+        strata::core::TpPair tpp;
         if (tp) {
             if (o.spec_split || o.native_dense_gguf.empty()) {
                 std::fprintf(stderr, "strata generate: --tensor-split needs --native and no --spec-split\n");
                 return 2;
             }
-            if (!strata::core::tp_half_geometry(g, gh, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 2; }
             if (o.pcie_frac > 0.0) {
                 std::fprintf(stderr, "strata generate: --tensor-split does not divide the PCIe share: --pcie-frac 0\n");
                 return 2;
             }
-            if (tp_pair_gpus) {
-                int n_dev = 0;
-                cudaGetDeviceCount(&n_dev);
-                if (n_dev < 2 || !strata::kernels::tp_enable_peer(0, 1)) {
-                    std::fprintf(stderr, "strata generate: --tensor-split pair needs two GPUs with peer access (%d visible)\n", n_dev);
-                    return 2;
-                }
-            }
-            if (!tp_own) {   // the routed experts' halves, gathered from the full cache's slots: on GPU 0 in place, onto
-                // GPU 1 (STRATA_TP_FROM_CACHE=1) as a whole-blob peer copy into its ring, then the gather there
-                const Clock::time_point t0 = Clock::now();
-                const std::vector<int32_t> sl = strata::core::tp_slot_layers(host_res, g.n_layers, g.n_expert, xcache.slots());
-                for (int c = 0; c < 2; ++c) {
-                    const strata::core::OnDevice on(tp_dev[c]);
-                    if (!th[c].open(sl, c, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
-                    for (int32_t s = 0; s < (int32_t) sl.size(); ++s)
-                        if (sl[(size_t) s] >= 0 &&
-                            !(tp_dev[c] == 0 ? th[c].fill(s, xcache.device_slot(s), nullptr, err)
-                                             : th[c].fill_staged(s, xcache.device_slot(s), nullptr, err))) {
-                            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                            return 1;
-                        }
-                    if (cudaDeviceSynchronize() != cudaSuccess) {
-                        std::fprintf(stderr, "strata generate: tensor split: the expert halves' copies failed (GPU %d)\n", tp_dev[c]);
-                        return 1;
-                    }
-                }
-                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                int32_t s0 = 0;
-                while (s0 < (int32_t) sl.size() && sl[(size_t) s0] < 0) ++s0;
-                if (s0 < (int32_t) sl.size()) {   // the first and the last filled slot, both halves, byte for byte
-                    for (int32_t s : {s0, (int32_t) sl.size() - 1}) {
-                        if (sl[(size_t) s] < 0) continue;
-                        std::vector<uint8_t> full((size_t) strata::kernels::cpu::expert_layout().blob_bytes(sl[(size_t) s]));
-                        if (cudaMemcpy(full.data(), xcache.device_slot(s), full.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
-                            !th[0].verify_slot(s, full.data(), err) || !th[1].verify_slot(s, full.data(), err)) {
-                            std::fprintf(stderr, "strata generate: %s\n", err.empty() ? "tensor split: read-back failed" : err.c_str());
-                            return 1;
-                        }
-                    }
-                }
-                std::fprintf(stderr, "strata generate: tensor split experts: %zu slots halved, 2 x %.2f GiB, %.0f ms; "
-                                     "first and last slot verified\n",
-                             sl.size(), (double) th[0].bytes() / 1073741824.0, ms);
-            }
-            for (int c = 0; c < 2; ++c) {
-                const strata::core::OnDevice on(tp_dev[c]);
-                void* sb = nullptr;
-                void* ps = nullptr;
-                if (!tw[c].build(wt, o.native_dense_gguf, g, c, err) || (tp_dev[c] != 0 && !tw[c].localize(err)) ||
-                    cudaMalloc(&sb, strata::core::session_bytes(gh, o.max_context, K)) != cudaSuccess ||
-                    (tp_mem.push_back(sb), cudaMalloc(&ps, strata::core::ple_run_scratch_bytes()) != cudaSuccess)) {
-                    std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c,
-                                 err.empty() ? "out of device memory (raise --vram-reserve-mib)" : err.c_str());
-                    return 1;
-                }
-                tp_mem.push_back(ps);
-                if (strata::core::session_init(gh, o.max_context, K, sb, hs[c]) == 0 ||
-                    !strata::core::tp_split_state(g, ss, gh, hs[c], c, ps, tw[c].q8_1(), err)) {
-                    std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c, err.c_str());
-                    return 1;
-                }
-                if (tp_dev[c] != 0 && hs[c].ple.ready()) {   // the PLE block's weights: this GPU's replicas
-                    auto& w = hs[c].ple.w;
-                    w.key_codes = (const uint8_t*) tw[c].local(w.key_codes);
-                    w.key_scales = (const float*) tw[c].local(w.key_scales);
-                    w.value_bf16 = (const uint16_t*) tw[c].local(w.value_bf16);
-                    w.norm_key = (const float*) tw[c].local(w.norm_key);
-                    w.norm_query = (const float*) tw[c].local(w.norm_query);
-                    w.norm_conv = (const float*) tw[c].local(w.norm_conv);
-                    w.conv1d_f16 = (const uint16_t*) tw[c].local(w.conv1d_f16);
-                    w.key_native_data = tw[c].local(w.key_native_data);
-                    w.key_bf16 = (const uint16_t*) tw[c].local(w.key_bf16);
-                    for (const void* q : {(const void*) w.key_codes, (const void*) w.key_scales, (const void*) w.value_bf16,
-                                          (const void*) w.norm_key, (const void*) w.norm_query, (const void*) w.norm_conv,
-                                          (const void*) w.conv1d_f16, w.key_native_data, (const void*) w.key_bf16})
-                        if (q != nullptr && strata::kernels::tp_pointer_device(q) >= 0 &&
-                            strata::kernels::tp_pointer_device(q) != tp_dev[c]) {
-                            std::fprintf(stderr, "strata generate: tensor split half %d: a PLE weight is not in the table "
-                                                 "and stays on another GPU\n", c);
-                            return 1;
-                        }
-                }
+            if (!tpp.open(g, tp_pair_gpus, tp_own, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 2; }
+            if ((!tp_own && !tpp.halves_from_cache(g, host_res, xcache, err)) ||
+                !tpp.build(wt, o.native_dense_gguf, g, ss, o.max_context, K, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
             }
             if (tp_own && std::getenv("STRATA_TP_FREE_FULL") && std::getenv("STRATA_TP_FREE_FULL")[0] == '1') {
                 // an experiment until the prompt path runs split (step 4): the whole-layer native projections are
                 // needed only by the prompt path, which has run - free what half 0 does not share, for more experts
                 std::set<const void*> keep;
-                for (const auto& [name, ref] : tw[0].table().all())
+                for (const auto& [name, ref] : tpp.tw[0].table().all())
                     if (ref.native_data) keep.insert(ref.native_data);
-                const strata::core::OnDevice on(tp_dev[0]);
+                const strata::core::OnDevice on(tpp.dev[0]);
                 const uint64_t freed = native_dense.release_except(keep);
                 std::fprintf(stderr, "strata generate: tensor split pair: %.2f GiB of whole-layer projections freed on GPU 0 "
                                      "(STRATA_TP_FREE_FULL: no prompt path after this)\n", (double) freed / 1073741824.0);
             }
-            if (tp_own && !tp_own_cache()) return 1;
-            for (int c = 0; c < 2; ++c) {
-                const strata::core::OnDevice on(tp_dev[c]);
-                vt[c].set_tensor_half(c, g.n_ff, !tp_pair_gpus);
-                strata::core::VerifyHits vhc = vh;   // this half's arena of half experts
-                vhc.cache_base = th[c].base();
-                vhc.slot_off = th[c].slot_offsets();
-                vhc.blob = vh.blob / 2;   // slots are sized by slot_off; this is only the "tier exists" mark
-                if (tp_dev[c] != 0) {   // the residency table on this GPU (read by the device plan only, which is off)
-                    int32_t* d = nullptr;
-                    if (cudaMalloc((void**) &d, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
-                        cudaMemcpy(d, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
-                        std::fprintf(stderr, "strata generate: tensor split half %d: residency table failed\n", c);
-                        return 1;
-                    }
-                    tp_mem.push_back(d);
-                    vhc.d_res = d;
-                }
-                if (!vt[c].init(tw[c].table(), gh, hs[c], vhc, c == 0 && native_head.loaded() ? &native_head : nullptr,
-                                o.spec, err)) {
-                    std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c, err.c_str());
+            if (tp_own) {
+                if (!tpp.own_cache(g, *srcp, o.expert_profile, o.vram_reserve_mib, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                     return 1;
                 }
-                std::fprintf(stderr, "strata generate: tensor split half %d on GPU %d: %zu tensors cut, %.1f MiB; %.1f MiB "
-                                     "replicated\n", c, tp_dev[c], tw[c].tensors(), (double) tw[c].bytes() / 1048576.0,
-                             (double) tw[c].replicated_bytes() / 1048576.0);
+                drive.d.host_res = tpp.res.data();
             }
-            if (!strata::core::Verifier::tp_pair(vt[0], vt[1], err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+            if (!tpp.init_verifiers(g, vh, host_res, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
-        strata::core::Verifier& V = tp ? vt[0] : ver;
+        strata::core::Verifier& V = tp ? tpp.vt[0] : ver;
         const bool use_mtp = !o.mtp.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, V.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -5108,7 +4933,7 @@ int main(int argc, char** argv) {
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         if (tp) {
             V.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
-            vt[1].set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            tpp.vt[1].set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         }
         drive.d.plan = V.plan_sink();
         int64_t tpc_windows = 0, tpc_rows = 0, tpc_top1 = 0;
@@ -5131,54 +4956,28 @@ int main(int argc, char** argv) {
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         // tensor split: every swap also refills both halves from the host arena (as on two GPUs, where no full cache
-        // exists); timed on the refill stream, and STRATA_TP_VERIFY_SWAPS=1 compares each half byte for byte
-        cudaEvent_t tp_sw0 = nullptr, tp_swm = nullptr, tp_sw1 = nullptr;
-        if (tp) { cudaEventCreate(&tp_sw0); cudaEventCreate(&tp_swm); cudaEventCreate(&tp_sw1); }
-        // two GPUs: half 1's refills run on GPU 1's own stream, timed there, and the swaps wait for both
-        cudaStream_t adapt_stream1 = nullptr;
-        cudaEvent_t tp1_a = nullptr, tp1_b = nullptr;
-        if (tp_pair_gpus && !drive.d.usage.empty()) {
-            const strata::core::OnDevice on(tp_dev[1]);
-            if (cudaStreamCreateWithFlags(&adapt_stream1, cudaStreamNonBlocking) != cudaSuccess) {
-                std::fprintf(stderr, "strata generate: cannot create GPU 1's refill stream\n");
-                return 1;
-            }
-            cudaEventCreate(&tp1_a);
-            cudaEventCreate(&tp1_b);
-        }
-        double tp_half1_ms = 0;
+        // exists); timed on the refill streams, and STRATA_TP_VERIFY_SWAPS=1 compares each half byte for byte
         std::vector<std::pair<int32_t, const uint8_t*>> tp_fills;
         const bool tp_verify_swaps = tp && std::getenv("STRATA_TP_VERIFY_SWAPS") && std::getenv("STRATA_TP_VERIFY_SWAPS")[0] == '1';
-        int64_t tp_swapped = 0, tp_swap_batches = 0, tp_pin_failed = 0, tp_verified = 0;
-        double tp_swap_ms = 0, tp_half_ms = 0;
-        std::vector<int32_t>& res_tab = tp_own ? tp_res : host_res;   // the table the pool and the swaps use
+        int64_t tp_pin_failed = 0;
+        std::vector<int32_t>& res_tab = tpp.table(host_res);   // the table the pool and the swaps use
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
-            if (adapt_stream1 != nullptr) {
-                if (wait) cudaEventSynchronize(tp1_b);
-                else if (cudaEventQuery(tp1_b) != cudaSuccess) return;
-                float ms1 = 0;
-                if (cudaEventElapsedTime(&ms1, tp1_a, tp1_b) == cudaSuccess) tp_half1_ms += ms1;
-            }
             if (tp) {
-                float ms = 0;
-                if (cudaEventElapsedTime(&ms, tp_sw0, tp_swm) == cudaSuccess) tp_swap_ms += ms;
-                if (cudaEventElapsedTime(&ms, tp_swm, tp_sw1) == cudaSuccess) tp_half_ms += ms;
-                ++tp_swap_batches;
-                tp_swapped += (int64_t) pending.size();
-                if (tp_verify_swaps)
-                    for (const auto& [i, slot] : pending) {
-                        const uint8_t* b = srcp->blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
-                        std::string e;
-                        if (b == nullptr || !th[0].verify_slot(slot, b, e) || !th[1].verify_slot(slot, b, e)) {
-                            std::fprintf(stderr, "strata generate: tensor split swap check: %s\n", e.c_str());
-                            std::fflush(nullptr);
-                            std::_Exit(1);
-                        }
-                        ++tp_verified;
+                if (!tpp.fills_done(wait)) return;
+                if (tp_verify_swaps) {
+                    std::vector<std::pair<int32_t, const uint8_t*>> chk;
+                    for (const auto& [i, slot] : pending)
+                        chk.emplace_back(slot, srcp->blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert));
+                    std::string e;
+                    if (!tpp.verify(chk, e)) {
+                        std::fprintf(stderr, "strata generate: tensor split swap check: %s\n", e.c_str());
+                        std::fflush(nullptr);
+                        std::_Exit(1);
                     }
+                }
             }
             unpin_blobs(pin_live);
             for (const auto& [i, slot] : pending) {
@@ -5228,7 +5027,6 @@ int main(int argc, char** argv) {
                 const int pf = pin_blobs(std::move(spans), pin_live);
                 if (tp) tp_pin_failed += pf;
             }
-            if (tp && !swaps.empty()) cudaEventRecord(tp_sw0, adapt_stream);
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = res_tab[out];
@@ -5246,21 +5044,13 @@ int main(int argc, char** argv) {
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (tp && !swaps.empty()) {   // both halves from the same host blobs: gate/up pieces, the down rows' halves in 2D
-                cudaEventRecord(tp_swm, adapt_stream);
-                if (adapt_stream1 != nullptr) { const strata::core::OnDevice on(tp_dev[1]); cudaEventRecord(tp1_a, adapt_stream1); }
+            if (tp && !swaps.empty()) {   // both halves from the same host blobs: gate/up pieces, the down rows' halves
                 std::string e;
-                for (const auto& [slot, b] : tp_fills)
-                    for (int c = 0; c < 2; ++c) {
-                        const strata::core::OnDevice on(tp_dev[c]);
-                        if (!th[c].fill_staged(slot, b, (void*) (c == 1 && adapt_stream1 ? adapt_stream1 : adapt_stream), e)) {
-                            std::fprintf(stderr, "strata generate: %s\n", e.c_str());
-                            return false;
-                        }
-                    }
+                if (!tpp.fill(tp_fills, (void*) adapt_stream, e)) {
+                    std::fprintf(stderr, "strata generate: %s\n", e.c_str());
+                    return false;
+                }
                 tp_fills.clear();
-                cudaEventRecord(tp_sw1, adapt_stream);
-                if (adapt_stream1 != nullptr) { const strata::core::OnDevice on(tp_dev[1]); cudaEventRecord(tp1_b, adapt_stream1); }
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             for (float& v : drive.d.usage) v *= 0.7f;
@@ -5473,13 +5263,11 @@ int main(int argc, char** argv) {
             const std::string pr = V.profile_report();
             if (!pr.empty()) std::fprintf(stderr, "strata verify profile:%s\n", pr.c_str());
         }
-        if (tp && tp_swapped > 0)
-            std::fprintf(stderr, "strata tp swaps: %lld experts in %lld batches, per expert %.3f ms full slot, %.3f ms "
-                                 "halves on GPU 0 (%.3f ms half 1 on GPU 1); %lld page ranges left unregistered, %lld halves "
-                                 "verified\n",
-                         (long long) tp_swapped, (long long) tp_swap_batches, tp_swap_ms / (double) tp_swapped,
-                         tp_half_ms / (double) tp_swapped, tp_half1_ms / (double) tp_swapped,
-                         (long long) tp_pin_failed, (long long) tp_verified);
+        if (tp && tpp.swapped > 0)
+            std::fprintf(stderr, "strata tp swaps: %lld experts in %lld batches, per expert %.3f ms halves on GPU 0 (%.3f ms "
+                                 "half 1 on GPU 1); %lld page ranges left unregistered, %lld halves verified\n",
+                         (long long) tpp.swapped, (long long) tpp.batches, tpp.ms_half0 / (double) tpp.swapped,
+                         tpp.ms_half1 / (double) tpp.swapped, (long long) tp_pin_failed, (long long) tpp.verified);
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
