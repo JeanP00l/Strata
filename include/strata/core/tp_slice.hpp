@@ -65,6 +65,50 @@ private:
     size_t cut_ = 0;
 };
 
+/// The VRAM expert arena of one half: slot s holds half c of the expert the full cache's slot s holds - its gate and
+/// up rows [c*n_ff/2, (c+1)*n_ff/2) and the same half of every down row's K - which is exactly the native blob of an
+/// expert with ff width n_ff/2 (`native_expert_layout(gu, d, n_embd, n_ff/2)`), half the full blob's bytes.  Slots
+/// are sized by the layer they hold (a slot never changes layer), 256-byte aligned like `ExpertCache::open_sized`.
+class TpExpertHalves {
+public:
+    TpExpertHalves() = default;
+    ~TpExpertHalves();
+    TpExpertHalves(const TpExpertHalves&) = delete;
+    TpExpertHalves& operator=(const TpExpertHalves&) = delete;
+
+    /// `slot_layer[s]`: the layer slot s holds, or -1 for a slot never filled (no bytes).  On the current device.
+    bool open(const std::vector<int32_t>& slot_layer, int half, std::string& err);
+    /// Half c of the full native blob `full` (device memory, mapped or registered host memory, or pageable host
+    /// memory - `cudaMemcpyDefault`) into `slot`: gate and up as one piece each, down as a 2D copy of every row's
+    /// half.  Asynchronous on `stream`.
+    bool fill(int32_t slot, const uint8_t* full, void* stream, std::string& err);
+    /// The same from a HOST blob (the arena): the whole blob in one contiguous copy into a small device ring, then
+    /// the gather on the device.  A 2D copy straight from host memory went row by row: 5.77 ms per expert for both
+    /// halves against 0.27 for the whole contiguous blob [measured 30.09].  The ring is reused in stream order.
+    bool fill_host(int32_t slot, const uint8_t* full_host, void* stream, std::string& err);
+    /// Reads `slot` back and compares it byte for byte with half c gathered on the host from `full_host`.
+    bool verify_slot(int32_t slot, const uint8_t* full_host, std::string& err) const;
+
+    const uint8_t* base() const { return base_; }
+    const uint64_t* slot_offsets() const { return off_.data(); }
+    uint64_t bytes() const { return off_.empty() ? 0 : off_.back(); }
+    int32_t layer_of(int32_t slot) const { return slot >= 0 && (size_t) slot < layer_.size() ? layer_[(size_t) slot] : -1; }
+
+private:
+    uint8_t* base_ = nullptr;
+    std::vector<uint64_t> off_;
+    std::vector<int32_t> layer_;
+    int half_ = 0;
+    static constexpr int kRing = 4;
+    uint8_t* ring_ = nullptr;
+    size_t ring_blob_ = 0;
+    int ring_next_ = 0;
+};
+
+/// Which layer each of the full cache's `n_slots` slots holds, from the residency table (-1: none).
+std::vector<int32_t> tp_slot_layers(const std::vector<int32_t>& host_res, int64_t n_layers, int64_t n_expert,
+                                    int64_t n_slots);
+
 /// Copy the full session's state into half c's session (session_init'ed with the half geometry): the GDN
 /// recurrence and conv history of this half's heads/channels, the QSA KV of its kv head, the indexer state, the
 /// PLE history and window, the residual.  The PLE run is wired to the half's own history and `ple_scratch` /

@@ -820,6 +820,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
+        // tensor split: each sink's own arena (half experts); the plan itself is the same for both halves
+        const uint8_t* const base_p = P.cache_base ? P.cache_base : d.cache_base;
+        const uint64_t* const off_p = P.cache_base ? P.slot_off : d.cache_slot_off;
+        auto slot_ptr = [&](const uint8_t* base, const uint64_t* off, int32_t slot) {
+            return (unsigned long long) (base + (off ? (size_t) off[slot] : (size_t) slot * (size_t) d.cache_blob));
+        };
+        int32_t gslot[128];
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
         for (int q = 0; q < nd; ++q) {
@@ -831,8 +838,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
                     kd = 0;
-                    ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                 : (size_t) slot * (size_t) d.cache_blob));
+                    ptr = slot_ptr(base_p, off_p, slot);
+                    gslot[groups] = slot;
                 } else {
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->blob(d.layers, e);
@@ -878,6 +885,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        if (GpuPlanSink* M = P.mirror) {   // the other half: the same groups and entries, pointers into its arena
+            if (fetches > 0) {
+                d.failed = true;
+                d.fail = "a tensor split does not divide the PCIe share of the experts (--pcie-frac 0)";
+                d.fail_layer = d.layers;
+                return;
+            }
+            std::memcpy(M->counts, P.counts, 4 * sizeof(int32_t));
+            std::memcpy(M->start, P.start, (size_t) (groups + 1) * sizeof(int32_t));
+            std::memcpy(M->dst, P.dst, (size_t) entries * sizeof(int32_t));
+            std::memcpy(M->tok, P.tok, (size_t) entries * sizeof(int32_t));
+            M->start2[0] = P.start2[0];
+            for (int q = 0; q < groups; ++q) M->ptr[q] = slot_ptr(M->cache_base, M->slot_off, gslot[q]);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (M->publish) M->publish(M->ctx);
+            if (M->fetch) M->fetch(M->ctx, dma_src, 0, 0);
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);

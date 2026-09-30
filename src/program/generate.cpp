@@ -98,10 +98,11 @@ namespace {
 // a copy from a range only PART of which is registered fails ("invalid argument"), so the page ranges are merged
 // first and each merged span is registered once.  A span that does not register is copied through the staging
 // path.  Portable: a layer split copies to either card.
-void pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
+int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
+    int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)
 #if defined(STRATA_HIP)
     static const bool on = std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1';
-    if (!on || r.empty()) return;
+    if (!on || r.empty()) return 0;
     for (auto& [a, e] : r) { a &= ~(uintptr_t) 4095; e = (e + 4095) & ~(uintptr_t) 4095; }
     std::sort(r.begin(), r.end());
     size_t k = 0;
@@ -114,12 +115,15 @@ void pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*
         if (cudaHostRegister((void*) a, (size_t) (e - a), cudaHostRegisterReadOnly | cudaHostRegisterPortable) ==
             cudaSuccess)
             live.push_back((void*) a);
-        else
+        else {
             (void) cudaGetLastError();
+            ++failed;
+        }
     }
 #else
     (void) r; (void) live;
 #endif
+    return failed;
 }
 void unpin_blobs(std::vector<void*>& v) {
     for (void* p : v) (void) cudaHostUnregister(p);
@@ -4861,6 +4865,7 @@ int main(int argc, char** argv) {
         const bool tp_check = tp && std::getenv("STRATA_TP_CHECK") != nullptr;
         strata::core::ModelGeometry gh;
         strata::core::TpWeights tw[2];
+        strata::core::TpExpertHalves th[2];
         strata::core::SessionState hs[2];
         strata::core::Verifier vt[2];
         std::vector<void*> tp_mem;
@@ -4871,6 +4876,43 @@ int main(int argc, char** argv) {
                 return 2;
             }
             if (!strata::core::tp_half_geometry(g, gh, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 2; }
+            if (o.pcie_frac > 0.0) {
+                std::fprintf(stderr, "strata generate: --tensor-split does not divide the PCIe share: --pcie-frac 0\n");
+                return 2;
+            }
+            {   // the routed experts' halves, gathered from the full cache's slots on the device
+                const Clock::time_point t0 = Clock::now();
+                const std::vector<int32_t> sl = strata::core::tp_slot_layers(host_res, g.n_layers, g.n_expert, xcache.slots());
+                for (int c = 0; c < 2; ++c) {
+                    if (!th[c].open(sl, c, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                    for (int32_t s = 0; s < (int32_t) sl.size(); ++s)
+                        if (sl[(size_t) s] >= 0 && !th[c].fill(s, xcache.device_slot(s), nullptr, err)) {
+                            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                            return 1;
+                        }
+                }
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: tensor split: the expert halves' copies failed\n");
+                    return 1;
+                }
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                int32_t s0 = 0;
+                while (s0 < (int32_t) sl.size() && sl[(size_t) s0] < 0) ++s0;
+                if (s0 < (int32_t) sl.size()) {   // the first and the last filled slot, both halves, byte for byte
+                    for (int32_t s : {s0, (int32_t) sl.size() - 1}) {
+                        if (sl[(size_t) s] < 0) continue;
+                        std::vector<uint8_t> full((size_t) strata::kernels::cpu::expert_layout().blob_bytes(sl[(size_t) s]));
+                        if (cudaMemcpy(full.data(), xcache.device_slot(s), full.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+                            !th[0].verify_slot(s, full.data(), err) || !th[1].verify_slot(s, full.data(), err)) {
+                            std::fprintf(stderr, "strata generate: %s\n", err.empty() ? "tensor split: read-back failed" : err.c_str());
+                            return 1;
+                        }
+                    }
+                }
+                std::fprintf(stderr, "strata generate: tensor split experts: %zu slots halved, 2 x %.2f GiB, %.0f ms; "
+                                     "first and last slot verified\n",
+                             sl.size(), (double) th[0].bytes() / 1073741824.0, ms);
+            }
             for (int c = 0; c < 2; ++c) {
                 void* sb = nullptr;
                 void* ps = nullptr;
@@ -4888,7 +4930,11 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 vt[c].set_tensor_half(c, g.n_ff, true);
-                if (!vt[c].init(tw[c].table(), gh, hs[c], vh, c == 0 && native_head.loaded() ? &native_head : nullptr,
+                strata::core::VerifyHits vhc = vh;   // this half's arena of half experts
+                vhc.cache_base = th[c].base();
+                vhc.slot_off = th[c].slot_offsets();
+                vhc.blob = vh.blob / 2;   // slots are sized by slot_off; this is only the "tier exists" mark
+                if (!vt[c].init(tw[c].table(), gh, hs[c], vhc, c == 0 && native_head.loaded() ? &native_head : nullptr,
                                 o.spec, err)) {
                     std::fprintf(stderr, "strata generate: tensor split half %d: %s\n", c, err.c_str());
                     return 1;
@@ -4934,10 +4980,36 @@ int main(int argc, char** argv) {
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        // tensor split: every swap also refills both halves from the host arena (as on two GPUs, where no full cache
+        // exists); timed on the refill stream, and STRATA_TP_VERIFY_SWAPS=1 compares each half byte for byte
+        cudaEvent_t tp_sw0 = nullptr, tp_swm = nullptr, tp_sw1 = nullptr;
+        if (tp) { cudaEventCreate(&tp_sw0); cudaEventCreate(&tp_swm); cudaEventCreate(&tp_sw1); }
+        std::vector<std::pair<int32_t, const uint8_t*>> tp_fills;
+        const bool tp_verify_swaps = tp && std::getenv("STRATA_TP_VERIFY_SWAPS") && std::getenv("STRATA_TP_VERIFY_SWAPS")[0] == '1';
+        int64_t tp_swapped = 0, tp_swap_batches = 0, tp_pin_failed = 0, tp_verified = 0;
+        double tp_swap_ms = 0, tp_half_ms = 0;
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (tp) {
+                float ms = 0;
+                if (cudaEventElapsedTime(&ms, tp_sw0, tp_swm) == cudaSuccess) tp_swap_ms += ms;
+                if (cudaEventElapsedTime(&ms, tp_swm, tp_sw1) == cudaSuccess) tp_half_ms += ms;
+                ++tp_swap_batches;
+                tp_swapped += (int64_t) pending.size();
+                if (tp_verify_swaps)
+                    for (const auto& [i, slot] : pending) {
+                        const uint8_t* b = srcp->blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+                        std::string e;
+                        if (b == nullptr || !th[0].verify_slot(slot, b, e) || !th[1].verify_slot(slot, b, e)) {
+                            std::fprintf(stderr, "strata generate: tensor split swap check: %s\n", e.c_str());
+                            std::fflush(nullptr);
+                            std::_Exit(1);
+                        }
+                        ++tp_verified;
+                    }
+            }
             unpin_blobs(pin_live);
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
@@ -4983,8 +5055,10 @@ int main(int argc, char** argv) {
                     if (const uint8_t* b = srcp->blob(s.layer, s.in))
                         spans.emplace_back((uintptr_t) b,
                                            (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
-                pin_blobs(std::move(spans), pin_live);
+                const int pf = pin_blobs(std::move(spans), pin_live);
+                if (tp) tp_pin_failed += pf;
             }
+            if (tp && !swaps.empty()) cudaEventRecord(tp_sw0, adapt_stream);
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -4996,9 +5070,22 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
                 }
+                if (tp) tp_fills.emplace_back(slot, b);
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+            }
+            if (tp && !swaps.empty()) {   // both halves from the same host blobs: gate/up pieces, the down rows' halves in 2D
+                cudaEventRecord(tp_swm, adapt_stream);
+                std::string e;
+                for (const auto& [slot, b] : tp_fills)
+                    for (int c = 0; c < 2; ++c)
+                        if (!th[c].fill_host(slot, b, (void*) adapt_stream, e)) {
+                            std::fprintf(stderr, "strata generate: %s\n", e.c_str());
+                            return false;
+                        }
+                tp_fills.clear();
+                cudaEventRecord(tp_sw1, adapt_stream);
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             for (float& v : drive.d.usage) v *= 0.7f;
@@ -5207,6 +5294,12 @@ int main(int argc, char** argv) {
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
+        if (tp && tp_swapped > 0)
+            std::fprintf(stderr, "strata tp swaps: %lld experts in %lld batches, per expert %.3f ms full slot, %.3f ms both "
+                                 "halves; %lld page ranges left unregistered, %lld halves verified\n",
+                         (long long) tp_swapped, (long long) tp_swap_batches, tp_swap_ms / (double) tp_swapped,
+                         tp_half_ms / (double) tp_swapped,
+                         (long long) tp_pin_failed, (long long) tp_verified);
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),

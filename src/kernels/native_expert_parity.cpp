@@ -217,23 +217,23 @@ int main(int argc, char** argv) {
             }
         }
         // (c) the GPU: one group holding the NT entries
-        {
-            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        auto run_gpu = [&](const std::vector<uint8_t>& b, int64_t ff, std::vector<float>& out) {
+            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, ff);
             void *dblob, *dx, *dxq, *dscr;
             float* dout;
             unsigned long long* dptr;
             int32_t *dstart, *dn, *ddst, *dtok;
-            cudaMalloc(&dblob, blob.size());
+            cudaMalloc(&dblob, b.size());
             cudaMalloc(&dx, x.size() * 4);
             cudaMalloc(&dxq, (size_t) NT * H / 32 * 36);
-            cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, FF));
+            cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(NT, ff));
             cudaMalloc((void**) &dout, (size_t) NT * H * 4);
             cudaMalloc((void**) &dptr, 8);
             cudaMalloc((void**) &dstart, 8);
             cudaMalloc((void**) &dn, 4);
             cudaMalloc((void**) &ddst, NT * 4);
             cudaMalloc((void**) &dtok, NT * 4);
-            cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(dblob, b.data(), b.size(), cudaMemcpyHostToDevice);
             cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
             const unsigned long long p = (unsigned long long) dblob;
             const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
@@ -245,9 +245,31 @@ int main(int argc, char** argv) {
             strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
             strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
             cudaStreamSynchronize(s);
-            cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost);
             cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
             cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
+        };
+        run_gpu(blob, FF, got_g);
+        // (d) EP_HALF=1: the tensor split's two halves (ff rows [0,320) and [320,640), every down row's K halved -
+        // the gather tp_slice.cpp's TpExpertHalves does), each through the same kernel, summed: only the order of
+        // the down projection's fp32 sum may differ from (c)
+        if (std::getenv("EP_HALF") && std::atoi(std::getenv("EP_HALF")) == 1) {
+            const size_t gu = (size_t) (FF / 2) * f.gu_row, hd = f.d_row / 2;
+            std::vector<float> sum((size_t) NT * H, 0.0f), part((size_t) NT * H);
+            for (int c = 0; c < 2; ++c) {
+                std::vector<uint8_t> hb(2 * gu + (size_t) H * hd);
+                std::memcpy(hb.data(), blob.data() + c * gu, gu);
+                std::memcpy(hb.data() + gu, blob.data() + f.up_off + c * gu, gu);
+                for (int64_t r = 0; r < H; ++r)
+                    std::memcpy(hb.data() + 2 * gu + r * hd, blob.data() + f.down_off + r * f.d_row + c * hd, hd);
+                run_gpu(hb, FF / 2, part);
+                for (size_t i = 0; i < sum.size(); ++i) sum[i] += part[i];
+            }
+            const double rh = rel(sum, got_g), rr = rel(sum, ref);
+            const bool hok = rh < 1e-5 && std::isfinite(rh);
+            std::printf("          halves: blob 2 x %zu, half0+half1 vs whole gpu rel %.2e, vs float ref %.2e  %s\n",
+                        2 * gu + (size_t) H * hd, rh, rr, hok ? "ok" : "FAIL");
+            if (!hok) ++failures;
         }
         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
         const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);

@@ -130,6 +130,12 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// TENSOR SPLIT (tp_slice.hpp): this sink's own VRAM expert arena - a half's slots hold half experts, so its
+    /// group pointers are computed from its own base and offsets.  Null: the dispatch's `cache_base`/`cache_slot_off`.
+    const uint8_t* cache_base = nullptr;
+    const uint64_t* slot_off = nullptr;
+    /// The other half's sink: the same plan (groups, entries, tokens) with pointers into ITS arena, published too.
+    GpuPlanSink* mirror = nullptr;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).

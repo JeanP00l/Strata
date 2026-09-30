@@ -225,6 +225,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
         sink_.ctx = this;
+        if (tp_half_ >= 0) {   // a tensor split's half: the plan's pointers go into ITS arena of half experts
+            sink_.cache_base = hits.cache_base;
+            sink_.slot_off = hits.slot_off;
+        }
     }
 
     // ---- the device arena: the same sequence counted, then carved
@@ -248,6 +252,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
+        if (tp_half_ == 1) tp_zero_ = b.take<float>(T * K * N);   // a half with no CPU share: its "CPU rows", zeros
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
@@ -305,6 +310,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         device_plan_ = v != nullptr && std::atoi(v) != 0;
+        if (device_plan_ && tp_half_ >= 0) {
+            err = "verify: STRATA_VERIFY_DEVICE_PLAN does not work with a tensor split yet";
+            return false;
+        }
     }
     if (device_plan_) {
         bool ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
@@ -689,10 +698,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (!tp_routed()) {
-            // a tensor split's half 1: its share is the shared expert's half only - parts_ stays all zeros (never
-            // written), so the combine below gives exactly `shared_`
-        } else {
+        // TENSOR SPLIT: both halves compute their half of every VRAM expert (ff rows [320c, 320c+320) - the down
+        // projection's partial sum over them) from the same plan; the CPU's misses are whole experts, half 0 only
+        {
         if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
@@ -716,7 +724,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                const NativeExpertLayout L =
+                    native_expert_layout(f.gu_type, f.d_type, f.n_embd, tp_half_ >= 0 ? f.n_ff / 2 : f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
             } else {
@@ -737,7 +746,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 21, grp);
         grouped(p_ptr2, p_start2, p_counts + 2);
         stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+        if (tp_half_ == 1) {   // no CPU share: the GPU rows zeroed, the rest zeros too
+            copy_rows_from_mapped(parts_ + (size_t) tb * K * N, tp_zero_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                  p_dst, p_counts + 1, cs);
+        } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
@@ -1065,6 +1077,11 @@ bool Verifier::tp_pair(Verifier& h0, Verifier& h1, std::string& err) {
     h1.tp_ch_.peer_flags = h0.tp_ch_.flags;
     h0.tp_peer_ = &h1;
     h1.tp_peer_ = &h0;
+    if (h0.sink_.cache_base == nullptr || h1.sink_.cache_base == nullptr) {
+        err = "verify: tp_pair needs both halves' expert arenas (VerifyHits::cache_base)";
+        return false;
+    }
+    h0.sink_.mirror = &h1.sink_;   // the host's one plan, published to both halves
     std::fprintf(stderr, "strata verify: tensor split paired (devices %d and %d, exchange timeout %.0f ms)\n", h0.device_,
                  h1.device_, timeout_ms);
     return true;
@@ -1121,6 +1138,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         VDBG("layer %lld rang\n", (long long) l);
         cur_layer_ = want - 1;
         set_plan_slot(grp);
+        if (peer != nullptr) {   // the plan is mirrored into half 1's slot of the same group
+            peer->cur_layer_ = want - 1;
+            peer->set_plan_slot(grp);
+        }
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (pool != nullptr)
@@ -1139,6 +1160,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
+        }
+        if (peer != nullptr && *(volatile uint32_t*) peer->h_flagA_ != want) {
+            GpuPlanSink& ps = peer->sink_;
+            ps.counts[0] = 0;
+            ps.counts[1] = 0;
+            ps.counts[2] = 0;
+            ps.start[0] = 0;
+            ps.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) peer->h_flagA_ = want;
+            raise_flag(peer->h_flagB_, want);
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();

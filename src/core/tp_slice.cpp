@@ -3,6 +3,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -322,6 +323,137 @@ bool tp_split_state(const ModelGeometry& g, const SessionState& f, const ModelGe
         if (h.ple.w.key_native_data != nullptr) h.ple.w.key_native_q8_1 = ple_q8_1;
     }
     return ok(cudaDeviceSynchronize(), "sync");
+}
+
+// ---------------------------------------------------------------- the routed experts' halves
+
+std::vector<int32_t> tp_slot_layers(const std::vector<int32_t>& host_res, int64_t n_layers, int64_t n_expert,
+                                    int64_t n_slots) {
+    std::vector<int32_t> sl((size_t) std::max<int64_t>(n_slots, 0), -1);
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t e = 0; e < n_expert; ++e) {
+            const int32_t s = host_res[(size_t) (l * n_expert + e)];
+            if (s >= 0 && s < n_slots) sl[(size_t) s] = (int32_t) l;
+        }
+    return sl;
+}
+
+TpExpertHalves::~TpExpertHalves() {
+    if (base_) cudaFree(base_);
+    if (ring_) cudaFree(ring_);
+}
+
+namespace {
+struct HalfCut {   // one layer's cut, in bytes
+    size_t gu = 0;           // half the gate (or up) rows
+    size_t up_src = 0;       // where up starts in the full blob
+    size_t down_src = 0;     // where down starts in the full blob
+    size_t d_row = 0;        // a full down row
+    int64_t rows = 0;        // n_embd
+    size_t bytes = 0;        // the half blob
+};
+bool half_cut(int32_t layer, HalfCut& h) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || layer < 0 || (size_t) layer >= lay.fmt.size()) return false;
+    const auto& f = lay.fmt[(size_t) layer];
+    if (f.n_ff % 2 || f.d_row % 2) return false;
+    h.gu = (size_t) (f.n_ff / 2) * f.gu_row;
+    h.up_src = f.up_off;
+    h.down_src = f.down_off;
+    h.d_row = f.d_row;
+    h.rows = f.n_embd;
+    h.bytes = 2 * h.gu + (size_t) f.n_embd * (f.d_row / 2);
+    return 2 * h.bytes == f.bytes;
+}
+}  // namespace
+
+bool TpExpertHalves::open(const std::vector<int32_t>& slot_layer, int c, std::string& err) {
+    if (c != 0 && c != 1) { err = "tensor split experts: the half must be 0 or 1"; return false; }
+    half_ = c;
+    layer_ = slot_layer;
+    off_.assign(slot_layer.size() + 1, 0);
+    for (size_t s = 0; s < slot_layer.size(); ++s) {
+        HalfCut h;
+        if (slot_layer[s] >= 0 && !half_cut(slot_layer[s], h)) {
+            err = "tensor split experts: layer " + std::to_string(slot_layer[s]) +
+                  " does not halve (odd ff width, odd down row, or a blob that is not [gate | up | down])";
+            return false;
+        }
+        off_[s + 1] = off_[s] + (slot_layer[s] >= 0 ? ((uint64_t) h.bytes + 255) / 256 * 256 : 0);
+    }
+    if (cudaMalloc((void**) &base_, std::max<uint64_t>(off_.back(), 256)) != cudaSuccess) {
+        cudaGetLastError();
+        base_ = nullptr;
+        err = "tensor split experts: the half arena (" + std::to_string(off_.back() >> 20) +
+              " MiB) does not fit (raise --vram-reserve-mib to shrink the full cache)";
+        return false;
+    }
+    return true;
+}
+
+bool TpExpertHalves::fill(int32_t slot, const uint8_t* full, void* stream, std::string& err) {
+    HalfCut h;
+    const int32_t l = layer_of(slot);
+    if (l < 0 || full == nullptr || !half_cut(l, h)) { err = "tensor split experts: fill of an empty slot"; return false; }
+    cudaStream_t cs = (cudaStream_t) stream;
+    uint8_t* d = base_ + off_[(size_t) slot];
+    const size_t hd = h.d_row / 2;
+    const bool ok =
+        cudaMemcpyAsync(d, full + (size_t) half_ * h.gu, h.gu, cudaMemcpyDefault, cs) == cudaSuccess &&
+        cudaMemcpyAsync(d + h.gu, full + h.up_src + (size_t) half_ * h.gu, h.gu, cudaMemcpyDefault, cs) == cudaSuccess &&
+        cudaMemcpy2DAsync(d + 2 * h.gu, hd, full + h.down_src + (size_t) half_ * hd, h.d_row, hd, (size_t) h.rows,
+                          cudaMemcpyDefault, cs) == cudaSuccess;
+    if (!ok) {
+        err = std::string("tensor split experts: fill: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool TpExpertHalves::fill_host(int32_t slot, const uint8_t* full_host, void* stream, std::string& err) {
+    const int32_t l = layer_of(slot);
+    if (l < 0 || full_host == nullptr) { err = "tensor split experts: fill of an empty slot"; return false; }
+    if (ring_ == nullptr) {
+        ring_blob_ = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+        if (cudaMalloc((void**) &ring_, (size_t) kRing * ring_blob_) != cudaSuccess) {
+            cudaGetLastError();
+            ring_ = nullptr;
+            err = "tensor split experts: the refill ring does not fit";
+            return false;
+        }
+    }
+    const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+    uint8_t* stage = ring_ + (size_t) ring_next_ * ring_blob_;
+    ring_next_ = (ring_next_ + 1) % kRing;
+    if (bytes > ring_blob_ ||
+        cudaMemcpyAsync(stage, full_host, bytes, cudaMemcpyHostToDevice, (cudaStream_t) stream) != cudaSuccess) {
+        err = std::string("tensor split experts: refill copy: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return fill(slot, stage, stream, err);
+}
+
+bool TpExpertHalves::verify_slot(int32_t slot, const uint8_t* full_host, std::string& err) const {
+    HalfCut h;
+    const int32_t l = layer_of(slot);
+    if (l < 0 || !half_cut(l, h)) { err = "tensor split experts: verify of an empty slot"; return false; }
+    std::vector<uint8_t> want(h.bytes), got(h.bytes);
+    const size_t hd = h.d_row / 2;
+    std::memcpy(want.data(), full_host + (size_t) half_ * h.gu, h.gu);
+    std::memcpy(want.data() + h.gu, full_host + h.up_src + (size_t) half_ * h.gu, h.gu);
+    for (int64_t r = 0; r < h.rows; ++r)
+        std::memcpy(want.data() + 2 * h.gu + (size_t) r * hd, full_host + h.down_src + (size_t) r * h.d_row + (size_t) half_ * hd, hd);
+    if (cudaMemcpy(got.data(), base_ + off_[(size_t) slot], h.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "tensor split experts: read-back failed";
+        return false;
+    }
+    for (size_t i = 0; i < h.bytes; ++i)
+        if (got[i] != want[i]) {
+            err = "tensor split experts: half " + std::to_string(half_) + " of slot " + std::to_string(slot) +
+                  " (layer " + std::to_string(l) + ") differs at byte " + std::to_string(i) + " of " + std::to_string(h.bytes);
+            return false;
+        }
+    return true;
 }
 
 }  // namespace strata::core

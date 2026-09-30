@@ -110,9 +110,10 @@ public:
 
     /// TENSOR SPLIT (tp_slice.hpp): this verifier runs half `half` (0 or 1) of every layer, with the half geometry,
     /// the half weight table and its own session, and adds its partial sums with the other half's inside the graph
-    /// (tp_exchange.hpp) after the mixer's out-projection and after the MoE.  Half 0 runs the routed experts (the
-    /// host pool is its) and the head; half 1 only its share of the dense layers.  `routed_ff` is the routed
-    /// experts' own ff width (the full model's: they are not cut here).  Set before `init`, then `tp_pair`.
+    /// (tp_exchange.hpp) after the mixer's out-projection and after the MoE.  Both halves compute their half of
+    /// every VRAM expert's ff rows from one host plan (`VerifyHits` points at the half's own arena of half
+    /// experts); half 0 rings the host, adds the CPU's whole-expert misses and runs the head.  `routed_ff` is the
+    /// full routed experts' ff width (the scratch is sized for it).  Set before `init`, then `tp_pair`.
     /// `same_gpu`: both halves on this GPU - each gets a CU-masked stream (its own queue, half the CUs).
     void set_tensor_half(int half, int64_t routed_ff, bool same_gpu) { tp_half_ = half; tp_ff_ = routed_ff; tp_same_ = same_gpu; }
     /// Join two halves after both `init`s and before the first `run`: each side's receive buffers and flags,
@@ -247,6 +248,7 @@ private:
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
+    float* tp_zero_ = nullptr;   ///< tensor split, half 1: T*K*N zeros (its CPU rows)
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
