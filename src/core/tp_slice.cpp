@@ -8,6 +8,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/tp_exchange.hpp"
 
 #include <cuda_runtime.h>
 
@@ -239,6 +240,49 @@ bool TpWeights::build(const WeightTable& full, const std::vector<std::string>& s
     return true;
 }
 
+bool TpWeights::localize(std::string& err) {
+    int here = 0;
+    if (cudaGetDevice(&here) != cudaSuccess) { err = "tensor split: no current device"; return false; }
+    auto copy = [&](const void* p, uint64_t bytes, const std::string& name) -> const void* {
+        if (p == nullptr || bytes == 0) return p;
+        const int dev = strata::kernels::tp_pointer_device(p);
+        if (dev < 0 || dev == here) return p;
+        auto it = rep_.find(p);
+        if (it != rep_.end()) return it->second;
+        void* d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess || cudaMemcpy(d, p, bytes, cudaMemcpyDefault) != cudaSuccess) {
+            cudaGetLastError();
+            if (d) cudaFree(d);
+            err = "tensor split: cannot replicate " + name + " (" + std::to_string(bytes >> 20) + " MiB) on GPU " +
+                  std::to_string(here);
+            return nullptr;
+        }
+        allocs_.push_back(d);
+        rep_[p] = d;
+        rep_bytes_ += bytes;
+        return d;
+    };
+    for (auto& [name, ref] : table_.table_) {
+        if (ref.data != nullptr) {
+            const void* d = copy(ref.data, ref.bytes, name);
+            if (d == nullptr) return false;
+            ref.data = d;
+        }
+        if (ref.native_data != nullptr) {
+            const void* d = copy(ref.native_data,
+                                 strata::kernels::native_mmvq_weight_bytes(ref.native_type, (int) ref.ne0, (int) ref.ne1), name);
+            if (d == nullptr) return false;
+            ref.native_data = d;
+        }
+    }
+    return true;
+}
+
+const void* TpWeights::local(const void* p) const {
+    auto it = rep_.find(p);
+    return it == rep_.end() ? p : it->second;
+}
+
 bool tp_split_state(const ModelGeometry& g, const SessionState& f, const ModelGeometry& gh, SessionState& h, int c,
                     void* ple_scratch, void* ple_q8_1, std::string& err) {
     auto ok = [&](cudaError_t e, const char* what) {
@@ -410,7 +454,7 @@ bool TpExpertHalves::fill(int32_t slot, const uint8_t* full, void* stream, std::
     return true;
 }
 
-bool TpExpertHalves::fill_host(int32_t slot, const uint8_t* full_host, void* stream, std::string& err) {
+bool TpExpertHalves::fill_staged(int32_t slot, const uint8_t* full_host, void* stream, std::string& err) {
     const int32_t l = layer_of(slot);
     if (l < 0 || full_host == nullptr) { err = "tensor split experts: fill of an empty slot"; return false; }
     if (ring_ == nullptr) {
@@ -426,7 +470,7 @@ bool TpExpertHalves::fill_host(int32_t slot, const uint8_t* full_host, void* str
     uint8_t* stage = ring_ + (size_t) ring_next_ * ring_blob_;
     ring_next_ = (ring_next_ + 1) % kRing;
     if (bytes > ring_blob_ ||
-        cudaMemcpyAsync(stage, full_host, bytes, cudaMemcpyHostToDevice, (cudaStream_t) stream) != cudaSuccess) {
+        cudaMemcpyAsync(stage, full_host, bytes, cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess) {
         err = std::string("tensor split experts: refill copy: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }

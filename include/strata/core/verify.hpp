@@ -116,6 +116,14 @@ public:
     /// full routed experts' ff width (the scratch is sized for it).  Set before `init`, then `tp_pair`.
     /// `same_gpu`: both halves on this GPU - each gets a CU-masked stream (its own queue, half the CUs).
     void set_tensor_half(int half, int64_t routed_ff, bool same_gpu) { tp_half_ = half; tp_ff_ = routed_ff; tp_same_ = same_gpu; }
+    /// A tensor split's half: point it at its arena of half experts after `init` (before the first `run`; the
+    /// graphs read the plan's pointers, the arena only through them).
+    void set_tp_experts(const uint8_t* base, const uint64_t* slot_off) {
+        hits_.cache_base = base;
+        hits_.slot_off = slot_off;
+        sink_.cache_base = base;
+        sink_.slot_off = slot_off;
+    }
     /// Join two halves after both `init`s and before the first `run`: each side's receive buffers and flags,
     /// uncached, on its own device.  Half 0's `run`/`commit` then drive half 1 as well.
     static bool tp_pair(Verifier& h0, Verifier& h1, std::string& err);
@@ -148,6 +156,8 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// Adds the last window's stage stamps into the profile sums.
+    void prof_collect();
 
 private:
     bool capture(int T, std::string& err);

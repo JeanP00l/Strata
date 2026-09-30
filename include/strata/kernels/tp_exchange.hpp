@@ -53,6 +53,12 @@ void tp_free(void* p);
 /// never starts while the first spins in its exchange.  Null on failure (or where CU masks do not exist).
 void* tp_stream_cu_half(int half);
 
+/// Two halves on two GPUs: peer access both ways (already enabled counts as success).  False when either way
+/// cannot be enabled.
+bool tp_enable_peer(int dev_a, int dev_b);
+/// The GPU a pointer's memory lives on, or -1 for host memory (pinned, mapped or pageable) and unknown pointers.
+int tp_pointer_device(const void* p);
+
 /// x (n floats, this side's partial) <- part0 + part1.  Exchange number `step` of the window.
 void tp_allreduce(float* x, int64_t n, const TpChannel& ch, int step, void* stream);
 /// *ch.seq += exchanges: the window's last node.

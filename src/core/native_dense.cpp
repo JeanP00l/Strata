@@ -66,6 +66,21 @@ NativeDense::~NativeDense() {
     for (void* p : weights_) cudaFree(p);
 }
 
+uint64_t NativeDense::release_except(const std::set<const void*>& keep) {
+    uint64_t freed = 0;
+    std::vector<void*> kept;
+    std::vector<uint64_t> kept_sz;
+    for (size_t i = 0; i < weights_.size(); ++i) {
+        if (keep.count(weights_[i])) { kept.push_back(weights_[i]); kept_sz.push_back(sizes_[i]); continue; }
+        freed += sizes_[i];
+        cudaFree(weights_[i]);
+    }
+    weights_ = std::move(kept);
+    sizes_ = std::move(kept_sz);
+    bytes_ -= freed;
+    return freed;
+}
+
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key) {
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
@@ -180,6 +195,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
             weights_.push_back(item.data.release());
+            sizes_.push_back(item.bytes);
         }
         scratch_ = scratch.release();
         bytes_ = total;

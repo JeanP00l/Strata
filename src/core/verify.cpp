@@ -851,6 +851,40 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     return true;
 }
 
+void Verifier::prof_collect() {
+    const ModelGeometry& g = *g_;
+    cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
+    const int64_t L = g.n_layers;
+    auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
+    for (int64_t l = 0; l < L; ++l) {
+        const int kind = is_qsa_layer(g, l) ? 1 : 0;
+        unsigned long long prev = at(l, 0);
+        for (int i = 1; i <= 24; ++i) {
+            const unsigned long long x = at(l, i);
+            if (x == 0 || x < prev) continue;
+            prof_sum_[kind][i] += (double) (x - prev);
+            prev = x;
+        }
+        if (l + 1 < L && at(l + 1, 0) != 0 && at(l, 24) != 0 && at(l + 1, 0) > at(l, 24))   // this stage's layers only
+            prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
+        prof_sum_[kind][27] += (double) (at(l, 27) - at(l, 0));    // hc-read0: norm
+        prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
+        prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
+        prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
+    }
+    prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
+    {   // span: the stage's first layer start to its last layer's end (the rest of the stage's wall time is
+        // graph launch, the hand-off and the host's waits outside the stamps)
+        unsigned long long first = 0, last = 0;
+        for (int64_t l = 0; l < L; ++l) {
+            if (at(l, 0) != 0 && first == 0) first = at(l, 0);
+            if (at(l, 24) != 0) last = at(l, 24);
+        }
+        if (last > first && first != 0) prof_sum_[0][30] += (double) (last - first);
+    }
+    ++prof_windows_;
+}
+
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -877,6 +911,10 @@ std::string Verifier::profile_report() {
     if (next_ != nullptr) {   // a layer split: the next GPU's stage has its own stamps (its own clock)
         const std::string nx = next_->profile_report();
         if (!nx.empty()) out += " || next stage:" + nx;
+    }
+    if (tp_half_ == 0 && tp_peer_ != nullptr) {   // a tensor split: the other half's stages
+        const std::string nx = tp_peer_->profile_report();
+        if (!nx.empty()) out += " || half 1:" + nx;
     }
     return out;
 }
@@ -1197,37 +1235,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
     if (dbg_on_) cudaMemcpy(dbg_h_.data(), dbg_, dbg_h_.size() * 8, cudaMemcpyDeviceToHost);
-    if (prof_on_ && G == 1) {       // the window's GPU stage stamps
-        cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
-        const int64_t L = g.n_layers;
-        auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
-        for (int64_t l = 0; l < L; ++l) {
-            const int kind = is_qsa_layer(g, l) ? 1 : 0;
-            unsigned long long prev = at(l, 0);
-            for (int i = 1; i <= 24; ++i) {
-                const unsigned long long x = at(l, i);
-                if (x == 0 || x < prev) continue;
-                prof_sum_[kind][i] += (double) (x - prev);
-                prev = x;
-            }
-            if (l + 1 < L && at(l + 1, 0) != 0 && at(l, 24) != 0 && at(l + 1, 0) > at(l, 24))   // this stage's layers only
-                prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
-            prof_sum_[kind][27] += (double) (at(l, 27) - at(l, 0));    // hc-read0: norm
-            prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
-            prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
-            prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
-        }
-        prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
-        {   // span: the stage's first layer start to its last layer's end (the rest of the stage's wall time is
-            // graph launch, the hand-off and the host's waits outside the stamps)
-            unsigned long long first = 0, last = 0;
-            for (int64_t l = 0; l < L; ++l) {
-                if (at(l, 0) != 0 && first == 0) first = at(l, 0);
-                if (at(l, 24) != 0) last = at(l, 24);
-            }
-            if (last > first && first != 0) prof_sum_[0][30] += (double) (last - first);
-        }
-        ++prof_windows_;
+    if (prof_on_ && G == 1) prof_collect();   // the window's GPU stage stamps
+    if (peer != nullptr && peer->prof_on_ && G == 1) {   // and the other half's (its own clock)
+        const OnDevice on(peer->device_);
+        peer->prof_collect();
     }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to

@@ -23,6 +23,7 @@
 #include "strata/core/weights.hpp"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,13 @@ public:
 
     bool build(const WeightTable& full, const std::vector<std::string>& shards, const ModelGeometry& g, int half,
                std::string& err);
+    /// Two GPUs: copy every tensor the table still shares with the full one and that lives on ANOTHER GPU (the
+    /// replicated norms, hyper-connections, router, indexer, the PLE's weights) onto the current one.  Host memory
+    /// (the mapped token embedding) stays shared.  Call on the half's device after `build`.
+    bool localize(std::string& err);
+    /// Where `localize` put a copy of `p` (the full table's pointer), or `p` itself when nothing was copied.
+    const void* local(const void* p) const;
+    uint64_t replicated_bytes() const { return rep_bytes_; }
     const WeightTable& table() const { return table_; }
     /// This half's own q8_1 scratch (the size the full table's native projections need), for the PLE key.
     void* q8_1() const { return q8_1_; }
@@ -63,6 +71,8 @@ private:
     void* q8_1_ = nullptr;
     uint64_t bytes_ = 0;
     size_t cut_ = 0;
+    std::map<const void*, void*> rep_;
+    uint64_t rep_bytes_ = 0;
 };
 
 /// The VRAM expert arena of one half: slot s holds half c of the expert the full cache's slot s holds - its gate and
@@ -82,10 +92,10 @@ public:
     /// memory - `cudaMemcpyDefault`) into `slot`: gate and up as one piece each, down as a 2D copy of every row's
     /// half.  Asynchronous on `stream`.
     bool fill(int32_t slot, const uint8_t* full, void* stream, std::string& err);
-    /// The same from a HOST blob (the arena): the whole blob in one contiguous copy into a small device ring, then
-    /// the gather on the device.  A 2D copy straight from host memory went row by row: 5.77 ms per expert for both
+    /// The same through this GPU: the whole blob (host arena, or another GPU's slot) in one contiguous copy into a
+    /// small ring on this device, then the gather here.  A 2D copy straight from host memory went row by row: 5.77 ms per expert for both
     /// halves against 0.27 for the whole contiguous blob [measured 30.09].  The ring is reused in stream order.
-    bool fill_host(int32_t slot, const uint8_t* full_host, void* stream, std::string& err);
+    bool fill_staged(int32_t slot, const uint8_t* full_host, void* stream, std::string& err);
     /// Reads `slot` back and compares it byte for byte with half c gathered on the host from `full_host`.
     bool verify_slot(int32_t slot, const uint8_t* full_host, std::string& err) const;
 

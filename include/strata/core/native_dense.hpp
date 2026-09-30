@@ -28,11 +28,15 @@ public:
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage).
     /// Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
+    /// Frees every projection not in `keep` (tensor split on two GPUs: the halves hold their own cuts, and the
+    /// whole-layer tensors are needed only by the prompt path).  The table's refs to them dangle afterwards.
+    uint64_t release_except(const std::set<const void*>& keep);
     uint64_t weight_bytes() const { return bytes_; }
     size_t tensor_count() const { return weights_.size(); }
 
 private:
     std::vector<void*> weights_;
+    std::vector<uint64_t> sizes_;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
 };

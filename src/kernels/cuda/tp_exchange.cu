@@ -8,6 +8,7 @@
 #endif
 
 #include <algorithm>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 
@@ -120,6 +121,35 @@ void* tp_stream_cu_half(int half) {
 #else
     (void) half;
     return nullptr;
+#endif
+}
+
+bool tp_enable_peer(int a, int b) {
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess) return false;
+    bool ok = true;
+    for (const auto& [from, to] : {std::pair<int, int>{a, b}, std::pair<int, int>{b, a}}) {
+        int can = 0;
+        if (cudaDeviceCanAccessPeer(&can, from, to) != cudaSuccess || !can) { ok = false; break; }
+        cudaSetDevice(from);
+        const cudaError_t e = cudaDeviceEnablePeerAccess(to, 0);
+        if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+        cudaGetLastError();
+    }
+    cudaSetDevice(prev);
+    return ok;
+}
+
+int tp_pointer_device(const void* p) {
+    if (p == nullptr) return -1;
+#if defined(STRATA_HIP)
+    hipPointerAttribute_t a{};
+    if (hipPointerGetAttributes(&a, p) != hipSuccess) { (void) hipGetLastError(); return -1; }
+    return a.type == hipMemoryTypeDevice ? a.device : -1;
+#else
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) { cudaGetLastError(); return -1; }
+    return a.type == cudaMemoryTypeDevice ? a.device : -1;
 #endif
 }
 
