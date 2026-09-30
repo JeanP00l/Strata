@@ -300,6 +300,14 @@ void tp_wire_half(const SessionState& f, SessionState& h, void* ple_scratch, voi
 
 bool tp_copy_state(bool to_half, const ModelGeometry& g, SessionState& f, const ModelGeometry& gh, SessionState& h,
                    int c, int64_t p0, int64_t p1, std::string& err) {
+    // both sessions index qsa_states/gdn_state by global ordinal from 0: only whole-model sessions (0.1.30's layer
+    // range carve is for layer-split stages, never for a tensor split's full session or its halves)
+    for (const SessionState* s : {&f, &h})
+        if (s->qsa_ord0 != 0 || s->gdn_ord0 != 0 || s->layer_lo != 0 || s->layer_hi != g.n_layers) {
+            err = "tensor split state: a session carved for a layer range [" + std::to_string(s->layer_lo) + ", " +
+                  std::to_string(s->layer_hi) + ") - the tensor split needs whole-model sessions";
+            return false;
+        }
     auto ok = [&](cudaError_t e, const char* what) {
         if (e == cudaSuccess) return true;
         err = std::string("tensor split state (") + what + (to_half ? ", to a half): " : ", to the full session): ") +

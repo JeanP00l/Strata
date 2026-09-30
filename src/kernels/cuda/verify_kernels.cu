@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_runtime.h>
 
@@ -423,7 +424,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) __nanosleep(100);
+    while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
 }  // namespace
@@ -472,7 +473,7 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
-    while (*flag < value) __nanosleep(100);
+    while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
@@ -547,7 +548,7 @@ namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
 #if defined(STRATA_HIP)
     t = wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz (hipDeviceAttributeWallClockRate) -> ns
 #elif defined(__HIPCC__)
-    t = wall_clock64() * 10ull;   // gfx11: a constant 100 MHz counter, in ns
+    t = wall_clock64() * 10ull;   // gfx11 / gfx12: a constant 100 MHz counter, in ns
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 #endif

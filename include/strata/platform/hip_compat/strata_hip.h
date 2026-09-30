@@ -45,6 +45,9 @@
 #define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
 #define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventDefault hipEventDefault
 #define cudaHostAllocDefault hipHostMallocDefault
@@ -126,6 +129,7 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags

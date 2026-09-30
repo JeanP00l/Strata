@@ -84,11 +84,15 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
-    // One token takes the multi-token kernel too (ggml-cpu would be as fast): the two differ in float order
-    // (~3e-8), and how many of a window's tokens an expert gets depends on the window size - with ggml-cpu for a
-    // single token, --spec 2 and --spec 4 gave different text.  STRATA_CPU_NT1_GGML=1: the old choice.
-    static const int nt_min = std::getenv("STRATA_CPU_NT1_GGML") != nullptr ? 2 : 1;
-    if (nt >= nt_min && iq512_supported(f.gu_type)) {
+    // #152 / our d460c6f: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  Upstream's
+    // default is 2 (measured fastest on AVX-512); ours is 1: a token's expert rows round differently alone than in a
+    // group, and with ggml-cpu for a single token --spec 2 and --spec 4 gave different text.  STRATA_IQ_MT_MIN=2 is
+    // upstream's choice (STRATA_CPU_NT1_GGML=1, our old name for it, still works).
+    static const int mt_min = [] {
+        if (const char* e = std::getenv("STRATA_IQ_MT_MIN")) return std::atoi(e);
+        return std::getenv("STRATA_CPU_NT1_GGML") != nullptr ? 2 : 1;
+    }();
+    if (nt >= mt_min && iq512_supported(f.gu_type)) {
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
@@ -117,8 +121,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
-    static const int nt_min = std::getenv("STRATA_CPU_NT1_GGML") != nullptr ? 2 : 1;   // see native_gu_rows
-    if (nt >= nt_min && f.d_type == 20 && iq4nl_mt) {
+    static const int mt_min = [] {   // see native_gu_rows
+        if (const char* e = std::getenv("STRATA_IQ_MT_MIN")) return std::atoi(e);
+        return std::getenv("STRATA_CPU_NT1_GGML") != nullptr ? 2 : 1;
+    }();
+    if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
