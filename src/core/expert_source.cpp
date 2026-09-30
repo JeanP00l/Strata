@@ -1318,6 +1318,22 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
 }
 
+// Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
+// unmaps them from this process; they stay in the page cache as clean, unmapped pages - the first the kernel takes
+// back under pressure, and a minor fault away when the CPU needs the expert again (an adaptive swap evicts it).
+// Dropping them from the cache too (POSIX_FADV_DONTNEED) made every eviction a re-read from the disk: ~200 major
+// faults a second in decode, +8 ms a window.  The memory the arena used to hold was never the cache itself but
+// ROCclr's pin-in-place locks on it (see main) - locked pages are the ones the kernel cannot take back.
+uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
+    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
+    const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
+    if (end <= off) return 0;
+    if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
+    return end - off;
+}
+
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();

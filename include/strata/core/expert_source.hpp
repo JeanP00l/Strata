@@ -100,6 +100,9 @@ public:
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
+    /// A file-backed source: this expert lives in VRAM, so its pages need not stay in RAM - hand them back to the
+    /// kernel (a later read re-reads the file; no result depends on it).  Returns the bytes released; 0 elsewhere.
+    virtual uint64_t release(int64_t layer, int64_t expert) { (void) layer; (void) expert; return 0; }
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -399,6 +402,7 @@ public:
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;
+    uint64_t release(int64_t layer, int64_t expert) override;
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
