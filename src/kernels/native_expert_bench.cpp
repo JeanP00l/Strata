@@ -43,7 +43,10 @@ int main(int argc, char** argv) {
     const int iters = argc > 7 ? std::atoi(argv[7]) : 200;
     const int NTOK = 8;
     if (T < 1 || T > NTOK || G < 1) { std::fprintf(stderr, "tokens 1..8, groups >= 1\n"); return 2; }
-    const int64_t H = 2560, FF = 640;
+    // EB_HALF=1: each expert cut to its first 320 ff rows (gate/up rows, the first half of every down row) - what
+    // one card holds under a tensor split by ff rows
+    const bool half = std::getenv("EB_HALF") && std::atoi(std::getenv("EB_HALF")) == 1;
+    const int64_t H = 2560, FF_FULL = 640, FF = half ? 320 : 640;
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
@@ -62,14 +65,20 @@ int main(int argc, char** argv) {
         if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
             std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
         }
-        const size_t dsz = f.bytes - f.down_off;
+        cpu::NativeFmt ff;    // the full expert's geometry, for strides into the GGUF
+        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF_FULL, ff, err)) {
+            std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
+        }
+        const size_t dsz = f.bytes - f.down_off, dsz_full = ff.bytes - ff.down_off;
+        const size_t drow = dsz / H, drow_full = dsz_full / H;
         std::vector<uint8_t> blobs((size_t) G * f.bytes);
         for (int g = 0; g < G; ++g) {
             const size_t E = (size_t) ((g * 37 + 5) % 256);
             uint8_t* b = blobs.data() + (size_t) g * f.bytes;
-            std::memcpy(b, gguf.tensor_data(*t[0]) + E * f.up_off, f.up_off);
-            std::memcpy(b + f.up_off, gguf.tensor_data(*t[1]) + E * f.up_off, f.up_off);
-            std::memcpy(b + f.down_off, gguf.tensor_data(*t[2]) + E * dsz, dsz);
+            std::memcpy(b, gguf.tensor_data(*t[0]) + E * ff.up_off, f.up_off);
+            std::memcpy(b + f.up_off, gguf.tensor_data(*t[1]) + E * ff.up_off, f.up_off);
+            for (int64_t r = 0; r < H; ++r)
+                std::memcpy(b + f.down_off + r * drow, gguf.tensor_data(*t[2]) + E * dsz_full + r * drow_full, drow);
         }
         std::mt19937 rng(17 + l);
         std::normal_distribution<float> nd(0.f, 1.f);
