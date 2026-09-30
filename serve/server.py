@@ -497,9 +497,10 @@ def gpu_list(cfg: dict) -> list[int]:
 
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
-    config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
+    config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32").  A config with
+    "--tensor-split" in its args splits every layer instead, and gets no layer split."""
     args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and "--tensor-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     return args
 

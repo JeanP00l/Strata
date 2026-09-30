@@ -103,6 +103,11 @@ bool TpPair::build(const WeightTable& wt, const std::vector<std::string>& shards
             err = "tensor split half " + std::to_string(c) + ": " + err;
             return false;
         }
+        // the halves' KV stays in VRAM (one kv head each: half the full session's), never streamed: their pinned host
+        // copies (another full KV's worth) did not fit beside the arena at 128K - `cannot pin` [30.09]
+        const int64_t resident = qsa_kv_resident();
+        qsa_set_kv_resident(0);
+        struct Restore { int64_t r; ~Restore() { qsa_set_kv_resident(r); } } restore{resident};
         if (cudaMalloc(&sb, session_bytes(gh, max_context, k)) != cudaSuccess) {
             err = "tensor split half " + std::to_string(c) + ": out of device memory (raise --vram-reserve-mib)";
             return false;
