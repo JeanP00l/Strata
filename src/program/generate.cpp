@@ -3198,10 +3198,13 @@ int main(int argc, char** argv) {
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
         int32_t lend_first_now = -1;      // where its buffers are laid out now
+        // a tensor split lends from the halves' arena on GPU 0 instead (set up with the halves, below)
+        const bool tp_lends = !o.tensor_split.empty() && !o.no_prefill_borrow;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
-        if (!o.no_prefill_borrow && d_res != nullptr) {
+        if (tp_lends) {
+        } else if (!o.no_prefill_borrow && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             if (const int64_t k = plan_lend(chunk); k > 0) {
                 if (o.prefill_auto)
@@ -3225,7 +3228,7 @@ int main(int argc, char** argv) {
         if (borrow != nullptr)
             std::fprintf(stderr, "strata serve: the prompt path borrows %lld cache slots (%.2f GiB)\n",
                          (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
-        else
+        else if (!tp_lends)
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
             rss_probe("the prompt path set up");
         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next
@@ -3239,7 +3242,7 @@ int main(int argc, char** argv) {
             }
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-        if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
+        if (!tp_lends && !sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
                 std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
@@ -3355,6 +3358,48 @@ int main(int argc, char** argv) {
                 return 1;
             }
             drive.d.host_res = tpp.res.data();
+        }
+        // A tensor split's prompt path borrows the LAST slots of the halves' arena on GPU 0 (the coldest experts of
+        // the profile) - the chunk halved until they fit with 128 slots to spare - and a request lends only what its
+        // own prompt needs.  Only half 0 is overwritten: the refill copies half 0 alone; GPU 1's halves stay valid.
+        const int32_t tp_slots = tp ? (int32_t) (tpp.res.empty() ? 0 : [&] {
+            int32_t n = 0;
+            for (const int32_t s : tpp.res) n = std::max(n, s + 1);
+            return n;
+        }()) : 0;
+        auto tp_lend_slots = [&](int64_t c) -> int64_t {
+            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+            const uint64_t* off = tpp.th[0].slot_offsets();
+            int64_t k = 0;
+            while (k < tp_slots && tpp.th[0].bytes() - off[tp_slots - k] < need) ++k;
+            return tpp.th[0].bytes() - off[tp_slots - k] < need ? -1 : k;
+        };
+        auto tp_lend_bytes = [&](int32_t first) -> uint64_t { return tpp.th[0].bytes() - tpp.th[0].slot_offsets()[first]; };
+        if (tp_lends) {
+            int64_t chunk = o.prefill_chunk, k = -1;
+            for (; chunk >= 256; chunk /= 2)
+                if (k = tp_lend_slots(chunk); k >= 0 && k + 128 <= tp_slots) break;
+            if (chunk < 256 || k < 0) {
+                std::fprintf(stderr, "strata serve: tensor split: the halves' arena (%d slots) cannot lend the prompt path "
+                                     "its buffers\n", (int) tp_slots);
+                return 1;
+            }
+            if (chunk != o.prefill_chunk)
+                std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in the halves' "
+                                     "arena\n", (long long) o.prefill_chunk, (long long) chunk);
+            o.prefill_chunk = chunk;
+            lend_first = (int32_t) (tp_slots - k);
+            lend_first_now = lend_first;
+            borrow = (void*) (tpp.th[0].base() + tpp.th[0].slot_offsets()[lend_first]);
+            borrow_bytes = tp_lend_bytes(lend_first);
+            std::fprintf(stderr, "strata serve: tensor split: the prompt path borrows %lld of %d half slots on GPU 0 "
+                                 "(%.2f GiB) for chunks of %lld\n", (long long) k, (int) tp_slots,
+                         (double) borrow_bytes / 1073741824.0, (long long) chunk);
+            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+            mem_mark("the prompt path in the halves' arena");
         }
         strata::core::Verifier& V = tp ? tpp.vt[0] : ver;
         if ((!tp && !ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) ||
@@ -4126,6 +4171,24 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
+                if (tp) {   // half 0 only, through GPU 0's ring from the host arena; GPU 1's halves were not lent
+                    const auto t0 = Clock::now();
+                    const strata::core::OnDevice on(tpp.dev[0]);
+                    size_t done = 0;
+                    for (const auto& [i, slot] : lent_now) {
+                        const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                        if (b == nullptr) { e = "tensor split refill: no blob"; return false; }
+                        if (!tpp.th[0].fill_staged(slot, b, (void*) adapt_stream, e)) return false;
+                        if ((++done & 255) == 0) cudaStreamSynchronize(adapt_stream);
+                    }
+                    if (cudaStreamSynchronize(adapt_stream) != cudaSuccess) { e = "tensor split refill failed"; return false; }
+                    for (const auto& [i, slot] : lent_now) tpp.res[(size_t) i] = slot;
+                    std::fprintf(stderr, "strata serve: tensor split: %zu lent half slots refilled in %.1f ms\n",
+                                 lent_now.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    lent_now.clear();
+                    lent_chunk = 0;
+                    return true;
+                }
                 for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
@@ -4152,6 +4215,28 @@ int main(int argc, char** argv) {
                 if (!lent_now.empty()) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
+                }
+                if (tp) {   // the tail of the halves' arena on GPU 0 (see tp_lend_slots)
+                    apply_pending(true);   // no swap may still be landing in a slot about to be lent
+                    const int64_t slots = tp_lend_slots(want);
+                    if (slots < 0 || slots > tp_slots - lend_first) {
+                        e = "prefill: request-sized buffers exceed the halves' lend region";
+                        return false;
+                    }
+                    const int32_t first = std::max<int32_t>(lend_first, (int32_t) (tp_slots - slots));
+                    if (want != sp.chunk() || first != lend_first_now) {
+                        if (!sp.relayout(want, (void*) (tpp.th[0].base() + tpp.th[0].slot_offsets()[first]),
+                                         tp_lend_bytes(first), e))
+                            return false;
+                        lend_first_now = first;
+                    }
+                    for (size_t i = 0; i < tpp.res.size(); ++i)
+                        if (tpp.res[i] >= first) {
+                            lent_now.emplace_back((int32_t) i, tpp.res[i]);
+                            tpp.res[i] = strata::core::kNotResident;
+                        }
+                    lent_chunk = want;
+                    return true;
                 }
                 const int64_t slots = lend_slots(want);
                 if (slots <= 0 || slots > xcache.slots() - lend_first) {
