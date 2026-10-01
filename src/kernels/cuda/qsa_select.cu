@@ -754,7 +754,9 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     // the blocks a query can have: the call's active count when the caller knows it (the prompt path), else the capacity.
     // Decode (no count) keeps the capacity rule and the original register width: nothing changes there.
 #if defined(__HIPCC__)
-    const bool counted = active_blocks > 0;
+    // STRATA_TOPK_CAPACITY=1: the capacity rule on HIP too (0.1.30's dispatch; gfx906 A/B against #337)
+    static const bool capacity = std::getenv("STRATA_TOPK_CAPACITY") != nullptr;
+    const bool counted = active_blocks > 0 && !capacity;
 #else
     // CUDA keeps 0.1.32's capacity rule: #337's dispatch was measured on RDNA4 only, and on the RTX 5070 the 64K
     // prompts read 1-3% slower with it
