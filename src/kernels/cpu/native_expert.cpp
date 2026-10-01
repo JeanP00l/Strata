@@ -5,6 +5,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
@@ -92,6 +93,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         if (const char* e = std::getenv("STRATA_IQ_MT_MIN")) return std::atoi(e);
         return std::getenv("STRATA_CPU_NT1_GGML") != nullptr ? 2 : 1;
     }();
+    // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
+    // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
+    // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
+    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
+        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     if (nt >= mt_min && iq512_supported(f.gu_type)) {
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -125,6 +134,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         if (const char* e = std::getenv("STRATA_IQ_MT_MIN")) return std::atoi(e);
         return std::getenv("STRATA_CPU_NT1_GGML") != nullptr ? 2 : 1;
     }();
+    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    if (kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
+        kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

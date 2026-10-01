@@ -39,6 +39,7 @@
 #include <atomic>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 #include <chrono>
 #include <cmath>
@@ -105,24 +106,78 @@ std::atomic<const Verifier*> g_diag_verifier{nullptr};
 void diag_active_verifier(std::FILE* f) {
     if (const Verifier* v = g_diag_verifier.load()) v->diag(f);
 }
+// #267: every live verifier (a layer split has one per stage), for the release before the engine ends
+constexpr int kLiveMax = 16;
+std::atomic<Verifier*> g_live[kLiveMax];
+void release_live_verifiers(std::FILE* f) {
+    for (auto& slot : g_live)
+        if (Verifier* v = slot.load()) {
+            const Clock::time_point t0 = Clock::now();
+            const bool done = v->release_gpu_waits(5000);
+            if (f != nullptr)
+                std::fprintf(f, "strata: released the verify window's GPU waits (#267): the GPU %s\n",
+                             done ? ("finished in " + std::to_string((long long) ms_since(t0)) + " ms").c_str()
+                                  : "did not finish within 5 s");
+        }
+    if (f != nullptr) std::fflush(f);
+}
+std::string released_note(bool drained) {
+    return drained ? "; its GPU waits were released and the GPU finished (#267)"
+                   : "; its GPU waits were released but the GPU did not finish within 5 s (#267)";
+}
+// #267 test hook: STRATA_TEST_VERIFY_STALL=N withholds the last layer's flag in the N-th window (1-based), so the
+// GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
+const int64_t g_test_stall = [] {
+    const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
+    return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
+}();
 }  // namespace
+
+bool Verifier::release_gpu_waits(int timeout_ms) {
+    released_.store(true);
+    // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
+    // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
+    // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+        if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    for (cudaStream_t s : {cs_, copy_}) {
+        if (s == nullptr) continue;
+        while (cudaStreamQuery(s) == cudaErrorNotReady) {
+            if (ms_since(t0) > timeout_ms) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    return true;
+}
 
 void Verifier::diag(std::FILE* f) const {
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
-    std::fprintf(f, "  verify window: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
-                    "served %u, plan (A) %u, copies (B) %u\n", last_t_, (long long) last_pos0_, cur_layer_ + 1,
-                 rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
+    // #251: outside a verify stage these are the LAST window's numbers (it finished), not the stalled work's
+    const char* where = progress().where.load();
+    const bool current = where != nullptr && std::strncmp(where, "verify window", 13) == 0;
+    std::fprintf(f, "  verify window%s: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
+                    "served %u, plan (A) %u, copies (B) %u\n", current ? "" : " (last window, not the current stage)",
+                 last_t_, (long long) last_pos0_, cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
 }
 
 Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
+    for (auto& slot : g_live) {
+        Verifier* me = this;
+        slot.compare_exchange_strong(me, nullptr);
+    }
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
+    if (commit_done_) cudaEventDestroy(commit_done_);
     if (arena_) cudaFree(arena_);
     for (void* p : {(void*) tp_ch_.recv, (void*) tp_ch_.flags, (void*) tp_ch_.seq, (void*) tp_ch_.err})
         strata::kernels::tp_free(p);
@@ -136,7 +191,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
+    for (auto& slot : g_live) {
+        Verifier* none = nullptr;
+        if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
+    }
+    release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -304,6 +365,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cs_ == nullptr) { err = "verify: the tensor split's CU-masked stream failed"; return false; }
     } else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
+        return false;
+    }
+    if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "verify: event create failed";
         return false;
     }
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
@@ -536,7 +601,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
-                if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): K and V rotated before they are stored
+                if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
                     fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 } else if (st.kv_hybrid) {   // K8V4: only V is rotated
@@ -576,6 +641,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         return false;
                     }
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
@@ -588,7 +654,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         return false;
                     }
                     norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
-                    if (st.kv_q4) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
+                    if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
                 }
                 for (int t = tb; t < te; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
@@ -609,7 +675,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 stamp(l, 13, grp);
-                if (st.kv_q4 || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
@@ -857,6 +923,11 @@ void Verifier::prof_collect() {
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
     const int64_t L = g.n_layers;
     auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
+    // upstream D8: a slot no kernel stamped is 0 and its unsigned difference wraps to ~1e19 ns; a missing or
+    // out-of-order stamp contributes nothing
+    const auto gap = [](unsigned long long to, unsigned long long from) {
+        return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
+    };
     for (int64_t l = 0; l < L; ++l) {
         const int kind = is_qsa_layer(g, l) ? 1 : 0;
         unsigned long long prev = at(l, 0);
@@ -866,14 +937,16 @@ void Verifier::prof_collect() {
             prof_sum_[kind][i] += (double) (x - prev);
             prev = x;
         }
-        if (l + 1 < L && at(l + 1, 0) != 0 && at(l, 24) != 0 && at(l + 1, 0) > at(l, 24))   // this stage's layers only
-            prof_sum_[kind][25] += (double) (at(l + 1, 0) - at(l, 24));
-        prof_sum_[kind][27] += (double) (at(l, 27) - at(l, 0));    // hc-read0: norm
-        prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
-        prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
-        prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
+        if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));   // this stage's layers only
+        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
+        if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
+            prof_sum_[kind][27] += dn;      // hc-read0: norm
+            prof_sum_[kind][28] += dd;      //           down
+            prof_sum_[kind][29] += du;      //           up
+            prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
+        }
     }
-    prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
+    prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
     {   // span: the stage's first layer start to its last layer's end (the rest of the stage's wall time is
         // graph launch, the hand-off and the host's waits outside the stamps)
         unsigned long long first = 0, last = 0;
@@ -1052,6 +1125,7 @@ bool Verifier::capture_commit(std::string& err) {
 bool Verifier::stage_window(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     using namespace strata::kernels;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -1152,7 +1226,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    for (int64_t k = 0; k < (le_ - lb_) * G; ++k) {
+    const int64_t steps = (le_ - lb_) * G;
+    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+    for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);
@@ -1173,7 +1249,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) { err = "verify: timed out at layer " + std::to_string(l); return false; }
+            if (now - a > std::chrono::seconds(20)) {
+                // #267: the caller ends the engine; no spin kernel may outlive it
+                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                return false;
+            }
         }
         const Clock::time_point b = Clock::now();
         VDBG("layer %lld rang\n", (long long) l);
@@ -1213,11 +1293,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *(volatile uint32_t*) peer->h_flagA_ = want;
             raise_flag(peer->h_flagB_, want);
         }
-        *flag = want;
+        if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+    // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
+    // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
+    // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
+    // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
+    // beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (tp_half_ >= 0) {   // a timed-out exchange summed garbage: refuse the window, loudly
@@ -1340,6 +1425,65 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
+bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                               std::string& err) {
+    if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
+    const OnDevice on_device(device_);
+    if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
+        err = "window_logprobs: no head logits for this window";
+        return false;
+    }
+    // run() synchronized cs_ before returning, so the head of this window is complete
+    std::vector<float> h((size_t) T * (size_t) n_vocab_);
+    if (cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "window_logprobs: the head logits copy failed";
+        return false;
+    }
+    for (int t = 0; t < T; ++t) {
+        const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
+        const int32_t tgt = targets[t];
+        if (tgt < 0 || (int64_t) tgt >= n_vocab_) continue;
+        int64_t top = 0;
+        for (int64_t v = 1; v < n_vocab_; ++v)
+            if (row[v] > row[top]) top = v;
+        const double maxv = row[top];
+        const bool has_extra = extra_id >= 0 && (int64_t) extra_id < n_vocab_;
+        double sum = 0.0, sum_without = 0.0;   // the second skips extra_id: no cancellation when it holds ~all mass
+        for (int64_t v = 0; v < n_vocab_; ++v) {
+            const double e = std::exp((double) row[v] - maxv);
+            sum += e;
+            if (v != (int64_t) extra_id) sum_without += e;
+        }
+        const double lse = maxv + std::log(sum);
+        const double extra = has_extra ? (double) row[extra_id] - lse : NAN;
+        const double without = has_extra && tgt != extra_id && sum_without > 0.0
+                                   ? (double) row[tgt] - (maxv + std::log(sum_without)) : NAN;
+        std::fprintf(out, "%lld\t%d\t%.9f\t%lld\t%.9f\t%d\t%.9f\t%.9f", (long long) (pos0 + t), (int) tgt,
+                     (double) row[tgt] - lse, (long long) top, maxv - lse, (int) (top == (int64_t) tgt), extra,
+                     without);
+        // STRATA_LOGPOS_TOPK=K: the K most likely tokens and their log-probabilities too (`id:logprob`), for a
+        // top-k comparison with another engine on the same tokens (docs/UNSLOTH_Q4.md)
+        static const int topk = [] {
+            const char* v = std::getenv("STRATA_LOGPOS_TOPK");
+            return v != nullptr ? std::max(0, std::min(256, std::atoi(v))) : 0;
+        }();
+        if (topk > 0) {
+            std::vector<int32_t> order((size_t) n_vocab_);
+            for (int64_t v = 0; v < n_vocab_; ++v) order[(size_t) v] = (int32_t) v;
+            std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                              [&](int32_t a, int32_t b) { return row[a] > row[b]; });
+            for (int j = 0; j < topk; ++j)
+                std::fprintf(out, "\t%d:%.6f", order[(size_t) j], (double) row[order[(size_t) j]] - lse);
+        }
+        std::fprintf(out, "\n");
+    }
+    std::fflush(out);
+    return true;
+}
+
+namespace { bool g_commit_async = false; }
+void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
@@ -1371,8 +1515,17 @@ bool Verifier::commit(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
+    // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
+    // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
+    if (!g_commit_async || next_ != nullptr) {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    } else {
+        const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+        if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
+        commit_pending_ = true;
+    }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
@@ -1384,6 +1537,23 @@ bool Verifier::commit(int n_keep, std::string& err) {
         if (!tp_peer_->commit(n_keep, err)) return false;
     }
     return next_ == nullptr || next_->commit(n_keep, err);
+}
+
+bool Verifier::wait_commit(std::string& err) {
+    if (commit_pending_) {
+        const OnDevice on_device(device_);
+        commit_pending_ = false;
+        const cudaError_t se = cudaEventSynchronize(commit_done_);
+        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    }
+    return next_ == nullptr || next_->wait_commit(err);
+}
+
+bool Verifier::copy_logits(int t, float* host) const {
+    if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
+    if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
 }  // namespace strata::core

@@ -34,6 +34,10 @@ public:
     /// Frees every projection not in `keep` (tensor split on two GPUs: the halves hold their own cuts, and the
     /// whole-layer tensors are needed only by the prompt path).  The table's refs to them dangle afterwards.
     uint64_t release_except(const std::set<const void*>& keep);
+    /// #326: a native pack whose `blk.1.ple_key.weight` row is unquantized (iq_pack --compat-bf16 of a GGUF key
+    /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
+    /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
+    static bool keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
     /// Of those, in pinned host memory (`load(..., host = true)`), and the largest one (the prompt path's staging).
     uint64_t host_bytes() const { return host_bytes_; }

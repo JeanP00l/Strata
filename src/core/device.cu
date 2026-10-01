@@ -92,6 +92,19 @@ std::string gpu_arch_problem(int ordinal) {
 #endif
 }
 
+std::string device_code_error() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP)
+    return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
+#else
+    // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
+    cudaFuncAttributes a{};
+    const cudaError_t e = cudaFuncGetAttributes(&a, poison_kernel);
+    if (e == cudaSuccess) return {};
+    cudaGetLastError();
+    return cudaGetErrorString(e);
+#endif
+}
+
 DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
@@ -145,10 +158,18 @@ DeviceInfo device_info(int ordinal) {
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else
-    if (d.cc_major * 10 + d.cc_minor < 75) {
+    // #236: the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON: Pascal sm_60, Volta sm_70) runs on the cards it
+    // was built for - refusing them below 7.5 there made the flag useless; the release engine keeps 7.5
+#if defined(STRATA_EXPERIMENTAL_SM60)
+    constexpr int kMinCc = 60;
+    const char* const kNeed = "6.0 or newer (this is the experimental Pascal / Volta build)";
+#else
+    constexpr int kMinCc = 75;
+    const char* const kNeed = "7.5 or newer (RTX 20 / 30 / 40 / 50 series)";
+#endif
+    if (d.cc_major * 10 + d.cc_minor < kMinCc) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
-                            "." + std::to_string(d.cc_minor) +
-                            "; Strata needs compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series)",
+                            "." + std::to_string(d.cc_minor) + "; Strata needs compute capability " + kNeed,
                         -1);
     }
 #endif
