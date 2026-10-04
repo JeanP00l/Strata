@@ -3,7 +3,7 @@
 #include "strata/kernels/tp_exchange.hpp"
 
 #include <cuda_runtime.h>
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
 #include <hip/hip_runtime.h>
 #endif
 
@@ -16,21 +16,21 @@ namespace strata::kernels {
 namespace {
 
 __device__ __forceinline__ uint32_t tp_load(const uint32_t* p) {
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 #else
     return *(const volatile uint32_t*) p;
 #endif
 }
 __device__ __forceinline__ void tp_store(uint32_t* p, uint32_t v) {
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     __builtin_nontemporal_store(v, p);
 #else
     *(volatile uint32_t*) p = v;
 #endif
 }
 __device__ __forceinline__ void tp_store_flag(uint32_t* p, uint32_t v) {
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 #else
     __threadfence_system();
@@ -38,7 +38,7 @@ __device__ __forceinline__ void tp_store_flag(uint32_t* p, uint32_t v) {
 #endif
 }
 __device__ __forceinline__ unsigned long long tp_clock() {
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     return wall_clock64();
 #else
     unsigned long long t;
@@ -63,7 +63,7 @@ __global__ void tp_allreduce_kernel(float* x, int n, float* peer_recv, uint32_t*
         tp_store_flag(peer_flags + slot * kTpMaxBlocks + blockIdx.x, seq);
         const unsigned long long t0 = tp_clock();
         while (tp_load(flags + slot * kTpMaxBlocks + blockIdx.x) < seq) {
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
             __builtin_amdgcn_s_sleep(1);
 #endif
             if (tp_clock() - t0 > timeout) {
@@ -95,7 +95,7 @@ void check(const char* what) {
 
 void* tp_alloc_uncached(size_t bytes) {
     void* p = nullptr;
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     if (hipExtMallocWithFlags(&p, bytes, hipDeviceMallocUncached) != hipSuccess) return nullptr;
 #else
     if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
@@ -107,7 +107,7 @@ void* tp_alloc_uncached(size_t bytes) {
 void tp_free(void* p) { if (p) cudaFree(p); }
 
 void* tp_stream_cu_half(int half) {
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     int dev = 0, cus = 0;
     if (hipGetDevice(&dev) != hipSuccess ||
         hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || cus < 2)
@@ -142,7 +142,7 @@ bool tp_enable_peer(int a, int b) {
 
 int tp_pointer_device(const void* p) {
     if (p == nullptr) return -1;
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     hipPointerAttribute_t a{};
     if (hipPointerGetAttributes(&a, p) != hipSuccess) { (void) hipGetLastError(); return -1; }
     return a.type == hipMemoryTypeDevice ? a.device : -1;

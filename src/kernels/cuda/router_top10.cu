@@ -187,7 +187,7 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
 }
 
 
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
 // AMD (wave64): the same routing in ONE wavefront per token.  The block-wide kernel above spends its time in
 // barriers - 10 selection passes with two __syncthreads each over 8 logical warps - not in arithmetic (43 us per
 // token on gfx906).  Here every lane holds up to RW_PER probabilities in registers and each pass is a 64-lane
@@ -261,7 +261,7 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
             weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
     }
 }
-#endif  // STRATA_HIP
+#endif  // STRATA_HIP_GFX906
 
 #if defined(__HIPCC__)
 // ---- S6, AMD: the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
@@ -423,8 +423,8 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
                   void* stream) {
 #if defined(__HIPCC__)
     {
-#if defined(STRATA_HIP)
-        // gfx906 (wave64): our one-wavefront kernel below stays the default; the S6 kernel is wave32-shaped and only
+#if defined(STRATA_HIP_GFX906)
+        // gfx906 (wave64): the one-wavefront kernel below stays the default; the S6 kernel is wave32-shaped and only
         // runs here on request (STRATA_HIP_ROUTER_FAST=1) until it is measured on this card
         static const bool old = std::getenv("STRATA_HIP_ROUTER_FAST") == nullptr;
 #else
@@ -458,7 +458,7 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
                      RT_MAX_THREADS * 64);
         std::exit(1);
     }
-#if defined(STRATA_HIP)
+#if defined(STRATA_HIP_GFX906)
     if (n_expert <= 64 * RW_PER && !std::getenv("STRATA_ROUTER_BLOCK")) {
         router_top10_wave_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(logits, n_tokens, n_expert, k,
                                                                                        ids, weights);

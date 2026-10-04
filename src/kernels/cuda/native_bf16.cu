@@ -186,7 +186,7 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 
 void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int ncols,
                               void* stream) {
-    // columns contiguous: upstream's multi-row kernel (weight read once, each output bitwise its one-row call),
+    // columns contiguous: the existing multi-row kernel (weight read once, each output bitwise its one-row call),
     // up to 8 rows per launch
     for (int c0 = 0; c0 < ncols; c0 += 8) {
         const int nc = ncols - c0 < 8 ? ncols - c0 : 8;

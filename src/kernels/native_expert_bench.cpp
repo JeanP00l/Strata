@@ -43,10 +43,7 @@ int main(int argc, char** argv) {
     const int iters = argc > 7 ? std::atoi(argv[7]) : 200;
     const int NTOK = 8;
     if (T < 1 || T > NTOK || G < 1) { std::fprintf(stderr, "tokens 1..8, groups >= 1\n"); return 2; }
-    // EB_HALF=1: each expert cut to its first 320 ff rows (gate/up rows, the first half of every down row) - what
-    // one card holds under a tensor split by ff rows
-    const bool half = std::getenv("EB_HALF") && std::atoi(std::getenv("EB_HALF")) == 1;
-    const int64_t H = 2560, FF_FULL = 640, FF = half ? 320 : 640;
+    const int64_t H = 2560, FF_FULL = 640, FF = FF_FULL;   // Flash-Next's expert geometry
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);

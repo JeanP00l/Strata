@@ -212,7 +212,7 @@ std::string gpu_arch_problem(int ordinal) {
 }
 
 std::string device_code_error() {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
 #else
     // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
@@ -263,8 +263,8 @@ DeviceInfo device_info(int ordinal) {
     // supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
     // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
     // backend checks the card against the architectures the binary was compiled for (and wave32).
-#if defined(STRATA_HIP)
-    // AMD gfx906 (our compat build, not upstream's STRATA_USE_HIP): the build targets one gfx arch
+#if defined(STRATA_HIP_GFX906)
+    // AMD gfx906 (the STRATA_HIP_GFX906 compat build, not STRATA_USE_HIP): the build targets one gfx arch
     // (CMAKE_HIP_ARCHITECTURES, wave64); a card of another arch fails at the first kernel launch with
     // hipErrorInvalidDeviceFunction.  gcnArchName says which it is.
     {

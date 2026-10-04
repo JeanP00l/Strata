@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-#define STRATA_HIP 1
+#define STRATA_HIP_GFX906 1
 
 // ---- runtime: types and constants ------------------------------------------------------------------------
 #define cudaError_t hipError_t

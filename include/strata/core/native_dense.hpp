@@ -19,21 +19,17 @@ public:
     ~NativeDense();
     NativeDense(const NativeDense&) = delete;
     NativeDense& operator=(const NativeDense&) = delete;
-    /// `host`: every projection except the PLE key in pinned, mapped host memory (`WeightRef::native_host`) - a
-    /// tensor split's halves hold their own cuts, and the whole-layer tensors serve only the prompt path, which
-    /// copies each to the card before its GEMM.  The PLE key stays in VRAM: the halves' PLE block reads it.
+    /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
+    /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-              bool include_ple_key = false, bool host = false);
+              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);
-    /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage).
-    /// Process-wide, read by the next `load`; (-1, -1) = all layers.
+    /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
+    /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
-    /// Frees every projection not in `keep` (tensor split on two GPUs: the halves hold their own cuts, and the
-    /// whole-layer tensors are needed only by the prompt path).  The table's refs to them dangle afterwards.
-    uint64_t release_except(const std::set<const void*>& keep);
     /// #326: a native pack whose `blk.1.ple_key.weight` row is unquantized (iq_pack --compat-bf16 of a GGUF key
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
