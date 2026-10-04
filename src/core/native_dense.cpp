@@ -34,16 +34,12 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
-struct DeviceFree {
-    bool host = false;
-    void operator()(void* p) const { if (p) { if (host) cudaFreeHost(p); else cudaFree(p); } }
-};
+struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
     int type;
     uint64_t bytes;
-    bool host;
     DevicePtr data;
 };
 }
@@ -78,33 +74,7 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 
 NativeDense::~NativeDense() {
     if (scratch_) cudaFree(scratch_);
-    for (size_t i = 0; i < weights_.size(); ++i) {
-        if (host_[i]) cudaFreeHost(weights_[i]);
-        else cudaFree(weights_[i]);
-    }
-}
-
-uint64_t NativeDense::release_except(const std::set<const void*>& keep) {
-    uint64_t freed = 0;
-    std::vector<void*> kept;
-    std::vector<uint64_t> kept_sz;
-    std::vector<bool> kept_host;
-    for (size_t i = 0; i < weights_.size(); ++i) {
-        if (keep.count(weights_[i])) {
-            kept.push_back(weights_[i]);
-            kept_sz.push_back(sizes_[i]);
-            kept_host.push_back(host_[i]);
-            continue;
-        }
-        freed += sizes_[i];
-        if (host_[i]) { cudaFreeHost(weights_[i]); host_bytes_ -= sizes_[i]; }
-        else cudaFree(weights_[i]);
-    }
-    weights_ = std::move(kept);
-    sizes_ = std::move(kept_sz);
-    host_ = std::move(kept_host);
-    bytes_ -= freed;
-    return freed;
+    for (void* p : weights_) cudaFree(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -203,21 +173,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
-                const bool on_host = host && tensor.name != "blk.1.ple_key.weight";
                 void* allocation = nullptr;
-                auto status = on_host ? cudaHostAlloc(&allocation, bytes, cudaHostAllocMapped | cudaHostAllocPortable)
-                                      : cudaMalloc(&allocation, bytes);
-                DevicePtr data(allocation, DeviceFree{on_host});
-                if (status == cudaSuccess) {
-                    if (on_host) std::memcpy(data.get(), gguf.tensor_data(tensor), bytes);
-                    else status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
-                }
+                auto status = cudaMalloc(&allocation, bytes);
+                DevicePtr data(allocation);
+                if (status == cudaSuccess)
+                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, on_host, std::move(data)});
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
@@ -231,14 +197,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
-            item.ref->native_host = item.host;
             weights_.push_back(item.data.release());
-            sizes_.push_back(item.bytes);
-            host_.push_back(item.host);
-            if (item.host) {
-                host_bytes_ += item.bytes;
-                largest_host_ = (std::max)(largest_host_, item.bytes);
-            }
         }
         scratch_ = scratch.release();
         bytes_ = total;

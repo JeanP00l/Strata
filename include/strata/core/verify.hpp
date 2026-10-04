@@ -27,7 +27,6 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
-#include "strata/kernels/tp_exchange.hpp"
 
 #include <cuda_runtime.h>
 
@@ -126,29 +125,6 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
-    /// TENSOR SPLIT (tp_slice.hpp): this verifier runs half `half` (0 or 1) of every layer, with the half geometry,
-    /// the half weight table and its own session, and adds its partial sums with the other half's inside the graph
-    /// (tp_exchange.hpp) after the mixer's out-projection and after the MoE.  Both halves compute their half of
-    /// every VRAM expert's ff rows from one host plan (`VerifyHits` points at the half's own arena of half
-    /// experts); half 0 rings the host, adds the CPU's whole-expert misses and runs the head.  `routed_ff` is the
-    /// full routed experts' ff width (the scratch is sized for it).  Set before `init`, then `tp_pair`.
-    /// `same_gpu`: both halves on this GPU - each gets a CU-masked stream (its own queue, half the CUs).
-    void set_tensor_half(int half, int64_t routed_ff, bool same_gpu) { tp_half_ = half; tp_ff_ = routed_ff; tp_same_ = same_gpu; }
-    /// A tensor split's half: point it at its arena of half experts after `init` (before the first `run`; the
-    /// graphs read the plan's pointers, the arena only through them).
-    void set_tp_experts(const uint8_t* base, const uint64_t* slot_off) {
-        hits_.cache_base = base;
-        hits_.slot_off = slot_off;
-        sink_.cache_base = base;
-        sink_.slot_off = slot_off;
-    }
-    /// Join two halves after both `init`s and before the first `run`: each side's receive buffers and flags,
-    /// uncached, on its own device.  Half 0's `run`/`commit` then drive half 1 as well.
-    static bool tp_pair(Verifier& h0, Verifier& h1, std::string& err);
-    /// The head's logits of the last window, row t (device), and the vocabulary size.
-    const float* head_logits(int t) const { return head_logits_ + (size_t) t * (size_t) n_vocab_; }
-    int64_t n_vocab() const { return n_vocab_; }
-
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
@@ -235,8 +211,6 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
-    /// Adds the last window's stage stamps into the profile sums.
-    void prof_collect();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
@@ -309,9 +283,6 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
-    bool dbg_on_ = false;                              // STRATA_DBG_LAYER_HASH: per (layer, point, token) fingerprints
-    unsigned long long* dbg_ = nullptr;
-    std::vector<unsigned long long> dbg_h_;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
@@ -374,7 +345,6 @@ private:
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
-    float* tp_zero_ = nullptr;   ///< tensor split, half 1: T*K*N zeros (its CPU rows)
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses

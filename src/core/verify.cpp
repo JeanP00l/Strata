@@ -292,8 +292,6 @@ Verifier::~Verifier() {
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
-    for (void* p : {(void*) tp_ch_.recv, (void*) tp_ch_.flags, (void*) tp_ch_.seq, (void*) tp_ch_.err})
-        strata::kernels::tp_free(p);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
@@ -363,7 +361,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
-    const int64_t FFR = tp_ff_ > 0 ? tp_ff_ : g.n_ff;
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
@@ -402,10 +399,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
         sink_.ctx = this;
-        if (tp_half_ >= 0) {   // a tensor split's half: the plan's pointers go into ITS arena of half experts
-            sink_.cache_base = hits.cache_base;
-            sink_.slot_off = hits.slot_off;
-        }
     }
 
     // ---- the device arena: the same sequence counted, then carved
@@ -430,16 +423,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
-        if (tp_half_ == 1) tp_zero_ = b.take<float>(T * K * N);   // a half with no CPU share: its "CPU rows", zeros
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
-        // the ROUTED experts' width: under a tensor split the geometry's n_ff is the half shared expert's
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, FFR),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), FFR)));
+            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -475,13 +466,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
-    }
-    dbg_on_ = std::getenv("STRATA_DBG_LAYER_HASH") != nullptr;
-    if (dbg_on_) {
-        const size_t nd = (size_t) g.n_layers * 5 * (size_t) max_t_;
-        const size_t nk = (size_t) g.n_layers * (size_t) max_t_ * (size_t) ss.k;   // per expert row: parts, hit_out
-        if (cudaMalloc((void**) &dbg_, (nd + 2 * nk) * 8) != cudaSuccess) { dbg_on_ = false; dbg_ = nullptr; cudaGetLastError(); }
-        else { cudaMemset(dbg_, 0, (nd + 2 * nk) * 8); dbg_h_.assign(nd + 2 * nk, 0); }
     }
     Bump real;
     real.base = (uint8_t*) arena_;
@@ -915,8 +899,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        if (tp_half_ >= 0) tp_allreduce(bo_ + tb * N, (int64_t) n * N, tp_ch_, xstep++, cs);   // the mixer's two halves
-        if (dbg_on_) dbg_hash_rows(bo_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 0) * max_t_ + tb, cs);
         gr_read_group(1, true, inj_, inj2_);
         static const bool sh_stream_env = [] {
             const char* e = std::getenv("STRATA_SH_STREAM");
@@ -1040,8 +1022,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L =
-                    native_expert_layout(f.gu_type, f.d_type, f.n_embd, tp_half_ >= 0 ? f.n_ff / 2 : f.n_ff);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
             } else {
@@ -1110,15 +1091,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
-        if (dbg_on_) {
-            dbg_hash_rows(bo_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 2) * max_t_ + tb, cs);
-            dbg_hash_rows(shared_ + tb * N, N, N, n, dbg_ + ((size_t) l * 5 + 3) * max_t_ + tb, cs);
-            dbg_hash_rows(parts_ + (size_t) tb * K * N, K * N, K * N, n, dbg_ + ((size_t) l * 5 + 4) * max_t_ + tb, cs);
-            unsigned long long* dk = dbg_ + (size_t) g.n_layers * 5 * max_t_;
-            const size_t nk = (size_t) g.n_layers * (size_t) max_t_ * (size_t) K, o = ((size_t) l * max_t_ + tb) * K;
-            dbg_hash_rows(parts_ + (size_t) tb * K * N, N, N, n * (int) K, dk + o, cs);
-            dbg_hash_rows(hit_out_ + (size_t) tb * K * N, N, N, n * (int) K, dk + nk + o, cs);
-        }
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
@@ -1137,10 +1109,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (tp_half_ >= 0) {
-        tp_advance(tp_ch_, (uint32_t) xstep, cs);
-        if (!tp_head()) return true;   // half 1: the residual is the same on both halves; half 0 runs the head
-    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
@@ -1205,54 +1173,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     return true;
 }
 
-void Verifier::prof_collect() {
-    const ModelGeometry& g = *g_;
-    cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
-    const int64_t L = g.n_layers;
-    auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
-    // upstream D8: a slot no kernel stamped is 0 and its unsigned difference wraps to ~1e19 ns; a missing or
-    // out-of-order stamp contributes nothing
-    const auto gap = [](unsigned long long to, unsigned long long from) {
-        return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
-    };
-    for (int64_t l = 0; l < L; ++l) {
-        const int kind = is_qsa_layer(g, l) ? 1 : 0;
-        unsigned long long prev = at(l, 0);
-        for (int i = 1; i <= 24; ++i) {
-            const unsigned long long x = at(l, i);
-            if (x == 0 || x < prev) continue;
-            prof_sum_[kind][i] += (double) (x - prev);
-            prev = x;
-        }
-        if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));   // this stage's layers only
-        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
-        if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
-            prof_sum_[kind][27] += dn;      // hc-read0: norm
-            prof_sum_[kind][28] += dd;      //           down
-            prof_sum_[kind][29] += du;      //           up
-            prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
-        }
-    }
-    prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
-    {   // span: the stage's first layer start to its last layer's end (the rest of the stage's wall time is
-        // graph launch, the hand-off and the host's waits outside the stamps)
-        unsigned long long first = 0, last = 0;
-        for (int64_t l = 0; l < L; ++l) {
-            if (at(l, 0) != 0 && first == 0) first = at(l, 0);
-            if (at(l, 24) != 0) last = at(l, 24);
-        }
-        if (last > first && first != 0) prof_sum_[0][30] += (double) (last - first);
-    }
-    ++prof_windows_;
-}
-
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "[span]", ""};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", "", ""};
     std::string out;
     char b[80];
     double total = 0;
@@ -1260,7 +1187,7 @@ std::string Verifier::profile_report() {
         out += k == 0 ? " GDN layers:" : " | QSA layers:";
         for (int i = 0; i < kProfPer; ++i) {
             if (prof_sum_[k][i] <= 0) continue;
-            if (i != 30) total += prof_sum_[k][i];   // the span overlaps the stages
+            total += prof_sum_[k][i];
             std::snprintf(b, sizeof b, " %s %.2f", names[i], prof_sum_[k][i] / 1e6 / (double) prof_windows_);
             out += b;
         }
@@ -1269,14 +1196,6 @@ std::string Verifier::profile_report() {
     out += b;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
-    if (next_ != nullptr) {   // a layer split: the next GPU's stage has its own stamps (its own clock)
-        const std::string nx = next_->profile_report();
-        if (!nx.empty()) out += " || next stage:" + nx;
-    }
-    if (tp_half_ == 0 && tp_peer_ != nullptr) {   // a tensor split: the other half's stages
-        const std::string nx = tp_peer_->profile_report();
-        if (!nx.empty()) out += " || half 1:" + nx;
-    }
     return out;
 }
 
@@ -1498,62 +1417,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    return true;
-}
-
-bool Verifier::tp_pair(Verifier& h0, Verifier& h1, std::string& err) {
-    using namespace strata::kernels;
-    if (h0.tp_half_ != 0 || h1.tp_half_ != 1 || h0.max_t_ != h1.max_t_ || h0.g_ == nullptr || h1.g_ == nullptr ||
-        h0.g_->n_embd != h1.g_->n_embd) {
-        err = "verify: tp_pair needs an initialized half 0 and half 1 of the same window size";
-        return false;
-    }
-    const char* tv = std::getenv("STRATA_TP_TIMEOUT_MS");
-    const double timeout_ms = tv ? std::atof(tv) : 10000.0;   // seconds: a late host launch once took > 200 ms
-    Verifier* side[2] = {&h0, &h1};
-    for (Verifier* v : side) {
-        const OnDevice on(v->device_);
-        TpChannel& ch = v->tp_ch_;
-        ch.slot_floats = (int64_t) v->max_t_ * v->g_->n_embd;
-        ch.recv = (float*) tp_alloc_uncached((size_t) (2 * ch.slot_floats) * sizeof(float));
-        ch.flags = (uint32_t*) tp_alloc_uncached((size_t) (2 * kTpMaxBlocks) * sizeof(uint32_t));
-        ch.seq = (uint32_t*) tp_alloc_uncached(64);
-        ch.err = (uint32_t*) tp_alloc_uncached(64);
-        ch.half = v->tp_half_;
-        ch.timeout_ticks = (uint64_t) (timeout_ms * 25000.0);   // the 25 MHz wall clock
-        if (!ch.recv || !ch.flags || !ch.seq || !ch.err) { err = "verify: the tensor split's exchange buffers failed"; return false; }
-    }
-    h0.tp_ch_.peer_recv = h1.tp_ch_.recv;
-    h0.tp_ch_.peer_flags = h1.tp_ch_.flags;
-    h1.tp_ch_.peer_recv = h0.tp_ch_.recv;
-    h1.tp_ch_.peer_flags = h0.tp_ch_.flags;
-    h0.tp_peer_ = &h1;
-    h1.tp_peer_ = &h0;
-    if (h0.sink_.cache_base == nullptr || h1.sink_.cache_base == nullptr) {
-        err = "verify: tp_pair needs both halves' expert arenas (VerifyHits::cache_base)";
-        return false;
-    }
-    h0.sink_.mirror = &h1.sink_;   // the host's one plan, published to both halves
-    std::fprintf(stderr, "strata verify: tensor split paired (devices %d and %d, exchange timeout %.0f ms)\n", h0.device_,
-                 h1.device_, timeout_ms);
-    return true;
-}
-
-bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                   std::string& err) {
-    using namespace strata::kernels;
-    const OnDevice on_device(device_);
-    if (!stage_window(T, tokens, pos0, err)) return false;
-    const ModelGeometry& g = *g_;
-    SessionState& ss = *ss_;
-    Verifier* peer = tp_half_ == 0 ? tp_peer_ : nullptr;
-    if (peer != nullptr) {   // the other half first: it runs to its first exchange and waits there
-        const OnDevice on(peer->device_);
-        if (!peer->stage_window(T, tokens, pos0, err)) return false;
-        const cudaError_t pe = cudaGraphLaunch(peer->exec_[T], peer->cs_);
-        if (pe != cudaSuccess) { err = std::string("verify: launch of half 1: ") + cudaGetErrorString(pe); return false; }
-        (void) cudaStreamQuery(peer->cs_);
-    }
     VDBG("staged; launching\n");
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
@@ -1620,10 +1483,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         VDBG("layer %lld rang\n", (long long) l);
         cur_layer_ = want - 1;
         set_plan_slot(grp);
-        if (peer != nullptr) {   // the plan is mirrored into half 1's slot of the same group
-            peer->cur_layer_ = want - 1;
-            peer->set_plan_slot(grp);
-        }
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
@@ -1840,27 +1699,6 @@ void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("S
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
-    if (dbg_on_)   // the kept tokens' fingerprints: mixer out, FFN in, MoE out per layer
-        for (int t = 0; t < n_keep; ++t)
-            for (int64_t l = lb_; l < le_; ++l)
-                std::fprintf(stderr, "strata dbg: pos %lld l %lld %04llx %04llx %04llx %04llx %04llx (T %d t %d)\n",
-                             (long long) (last_pos0_ + t), (long long) l, dbg_h_[((size_t) l * 5 + 0) * max_t_ + t] & 0xffff,
-                             dbg_h_[((size_t) l * 5 + 1) * max_t_ + t] & 0xffff, dbg_h_[((size_t) l * 5 + 2) * max_t_ + t] & 0xffff,
-                             dbg_h_[((size_t) l * 5 + 3) * max_t_ + t] & 0xffff, dbg_h_[((size_t) l * 5 + 4) * max_t_ + t] & 0xffff,
-                             last_t_, t);
-    if (dbg_on_ && std::getenv("STRATA_DBG_LAYER_HASH")[0] == '2')   // per routed expert (k order): its row, g = the GPU's
-        for (int t = 0; t < n_keep; ++t)
-            for (int64_t l = lb_; l < le_; ++l) {
-                const size_t K = (size_t) ss_->k, nk = (size_t) g_->n_layers * (size_t) max_t_ * K, o = ((size_t) l * max_t_ + t) * K;
-                const unsigned long long* dk = dbg_h_.data() + (size_t) g_->n_layers * 5 * max_t_;
-                std::string sline;
-                char b[48];
-                for (size_t j = 0; j < K; ++j) {
-                    std::snprintf(b, sizeof b, " %04llx%s", dk[o + j] & 0xffff, dk[o + j] == dk[nk + o + j] ? "g" : "c");
-                    sline += b;
-                }
-                std::fprintf(stderr, "strata dbgk: pos %lld l %lld%s\n", (long long) (last_pos0_ + t), (long long) l, sline.c_str());
-            }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
@@ -1886,10 +1724,6 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    if (tp_half_ == 0 && tp_peer_ != nullptr) {
-        const OnDevice on(tp_peer_->device_);
-        if (!tp_peer_->commit(n_keep, err)) return false;
-    }
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
